@@ -173,6 +173,27 @@ class Grid:
     def obstacles(self) -> frozenset[tuple[int, int]]:
         return self._obstacles
 
+    def with_added_obstacles(self, added: Iterable[tuple[int, int]]) -> "Grid":
+        """返回一份“在原障碍基础上新增静态障碍”的新 Grid（本对象不变）。
+
+        静态更新只允许新增：added 中的格子必须在界内、彼此不重复、也不得与
+        已有障碍重复（不静默去重，重复即带索引 ValueError）。构造失败时本对象
+        与返回值都不会处于半更新状态（直接抛异常，不返回新对象）。
+        """
+        if isinstance(added, (str, bytes)) or not isinstance(added, Iterable):
+            raise TypeError(f"added 必须是 (x, y) 坐标对的可迭代对象，收到 {type(added).__name__}")
+        cells: list[tuple[int, int]] = sorted(self._obstacles)
+        seen: set[tuple[int, int]] = set(self._obstacles)
+        for i, raw in enumerate(added):
+            cell = require_int_cell(f"added_obstacles[{i}]", raw, width=self._width, height=self._height)
+            if cell in seen:
+                raise ValueError(
+                    f"added_obstacles[{i}]={cell} 已是障碍（静态更新只允许新增，不做静默去重）"
+                )
+            seen.add(cell)
+            cells.append(cell)
+        return Grid(self._width, self._height, cells)
+
     def in_bounds(self, cell: tuple[int, int]) -> bool:
         x, y = cell
         return 0 <= x < self._width and 0 <= y < self._height

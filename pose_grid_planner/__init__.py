@@ -3,6 +3,7 @@
 公开接口：
     Grid, Heading, Pose, Action, StepEvidence, Plan,
     SearchStatus, SearchResult, plan, replay, ReplayError,
+    ReplanResult, replan,
     transition, successors, heuristic, MAX_GRID_SIDE
 """
 
@@ -18,12 +19,14 @@ from .model import (
     transition,
 )
 from .planner import (
+    ReplanResult,
     ReplayError,
     SearchResult,
     SearchStatus,
     heuristic,
     plan,
     replay,
+    replan,
 )
 
 __all__ = [
@@ -36,12 +39,14 @@ __all__ = [
     "StepEvidence",
     "successors",
     "transition",
+    "ReplanResult",
     "ReplayError",
     "SearchResult",
     "SearchStatus",
     "heuristic",
     "plan",
     "replay",
+    "replan",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

@@ -3,6 +3,10 @@
 离线移动机器人工程用可复用库：在障碍格上为“占两格、四朝向”的机器人做
 A* 姿态格规划，每个运动原语都带车体扫掠检查，输出动作序列与逐步扫掠证据。
 
+**本次迭代新增**：旧路径执行到指定姿态后接收一次**静态障碍更新**（只新增），
+保留已执行前缀，在更新后的网格上从当前位置**全量重新规划**剩余路径
+（`replan`，见下文“障碍更新后重规划”）。
+
 ## 运行环境
 
 - Python **3.14.7**（仅用标准库，**无需安装任何额外依赖**，`requirements.txt` 为空说明）
@@ -37,6 +41,7 @@ python demo.py                            # 固定输入演示：正常规划 + 
 from pose_grid_planner import (
     Grid, Pose, Heading, Action,            # 数据结构
     plan, replay,                           # 规划 / 重放
+    replan, ReplanResult,                   # 障碍更新后重规划
     SearchResult, SearchStatus,             # 结果与状态枚举
     Plan, StepEvidence,                     # 路径与逐步证据
     transition, successors, heuristic,      # 单步原语 / 后继 / 启发式
@@ -46,6 +51,8 @@ from pose_grid_planner import (
 
 - `Grid(width, height, obstacles=())` / `Grid.from_rows(["#.", ".#"])`
   构造不可变网格；构造期完成全部校验，失败不留下部分构造的对象。
+  `grid.with_added_obstacles([(x, y), ...])` 返回一份**只新增障碍**的新网格
+  （原网格不变）；越界、与已有障碍重复、新增列表内部重复均带索引报错。
 - `plan(grid, start, goal, *, max_expansions=None) -> SearchResult`
   - `SearchStatus.OPTIMAL`：`result.plan` 为最优 `Plan`
     （`actions` 动作序列、`total_cost` 总代价、`evidence` 逐步 `StepEvidence`，
@@ -56,6 +63,35 @@ from pose_grid_planner import (
 - `replay(grid, start, actions) -> (final_pose, evidence)`：逐步重放校验，
   任一步扫掠不通过抛 `ReplayError`（带步序号，可定位）。
 - `transition(grid, pose, action)`：单步执行，返回 `(下一姿态, 扫掠格)` 或 `None`。
+
+## 障碍更新后重规划
+
+```python
+result = replan(grid, start, goal, old_actions, executed_actions, added_obstacles,
+                *, max_expansions=None) -> ReplanResult
+```
+
+语义（本次迭代的核心能力）：
+
+1. 在**旧网格**上从 `start` 完整重放 `old_actions`（复用 `replay` 的车体扫掠
+   检查）——旧路径本身必须无碰撞，否则抛 `ReplayError`（带步序号）；
+2. 取前 `executed_actions` 步作为**已执行前缀**（事实不变、原样保留），
+   其末姿态即当前位置 `current_pose`；
+3. 把 `added_obstacles` 并入得到不可变的 `updated_grid`（只允许**新增**）；
+4. 当前占用格被新障碍压住属于自相矛盾的更新，抛 `ValueError`；
+5. 从当前姿态到**原 goal** 做全量 A*。`result.status` 复用 `SearchStatus`：
+   - `OPTIMAL`：`result.remainder` 为剩余段 `Plan`（仅剩余段，不含前缀），
+     `result.prefix` 为已执行前缀；`result.total_cost` = 前缀代价 + 剩余段代价，
+     `result.full_actions` 为两段动作拼接；
+   - `NO_PATH`：目标被新障碍埋住（`expansions=0`）或开集耗尽证明剩余段不可达；
+   - `BUDGET_EXHAUSTED`：剩余段搜索预算耗尽（与无解严格区分）。
+6. `grid`、`old_actions` 均不被修改；任何校验失败直接抛错，不返回半更新结果。
+
+边界：`executed_actions=0` 表示尚未执行（前缀为空、从 start 重搜）；
+`executed_actions=len(old_actions)` 表示已到目标（剩余段为空、代价 0）；
+新障碍落在**已走过**的格子上允许（只影响剩余搜索，不改写历史）。
+注意前缀证据按旧网格成立、剩余段证据按更新后网格成立，因此 `full_actions`
+只拼接动作、不跨网格拼接扫掠证据；两段可分别用 `replay` 核对。
 
 ## 错误语义
 
@@ -79,6 +115,9 @@ from pose_grid_planner import (
   证据即每步实际检查过的格子集合，可独立复核。
 - **预算语义**：`max_expansions` 限制“弹出扩展”的状态数；预算触顶单独返回
   `BUDGET_EXHAUSTED`，调用方可据此加大预算重试，而不会误读为无解。
+- **重规划复用同一套扫掠判定**：`replan` 不另写碰撞规则——旧路径用 `replay`
+  在旧网格上验证，剩余段用同一个 `plan`/`transition` 在新网格上全量搜索；
+  更新只允许新增静态障碍，前缀是不可变事实，失败一律抛错而非部分应用。
 - **测试独立参考**：`tests/dijkstra_reference.py` 不导入被测包，按题面契约
   重新推导占用/扫掠规则做全状态 Dijkstra，与 A* 在确定性随机场景（含 20×20 上限）
   对照最优代价与有/无解判定；往返一致性（重放）仅作补充检查。
@@ -90,11 +129,15 @@ from pose_grid_planner import (
 - 网格上限 20×20 为接口边界，超限构造即 `ValueError`。
 - 代价固定为 10/14/8，不可配置（题面契约）；需要其他代价体系请改 `Action.cost` 表。
 - 转向扫掠按“最小轴对齐 2×2”近似真实车体扫掠，不建模连续几何。
+- `replan` 按本次迭代范围实现：**一次**静态障碍更新、**全量**重新搜索、
+  单轮已执行前缀。不支持连续移动障碍、增量搜索的性能保证、以及多轮更新的
+  前缀提交机制；需要时应再次调用 `replan`（以上一次结果的剩余段为旧路径）。
 
 ## 目录结构
 
 ```
-pose_grid_planner/     # 库：model.py（数据结构+原语） planner.py（A*+重放） _validation.py
-tests/                 # unittest 测试 + dijkstra_reference.py（独立参考，不调用被测核心）
+pose_grid_planner/     # 库：model.py（数据结构+原语） planner.py（A*+重放+replan） _validation.py
+tests/                 # unittest 测试（原验收 + test_replan.py 重规划用例）
+                       # dijkstra_reference.py：独立参考，不调用被测核心
 demo.py                # 固定输入演示（真实计算，无 sleep/预录）
 ```
