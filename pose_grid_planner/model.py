@@ -161,6 +161,26 @@ class Grid:
                     raise ValueError(f"rows[{y}][{x}] 字符 {ch!r} 非法，只允许 '#' 和 '.'")
         return cls(width, height, obstacles)
 
+    def with_added_obstacles(self, cells: Iterable[tuple[int, int]]) -> "Grid":
+        """返回一份在本网格基础上“新增静态障碍”后的新 Grid（本对象不变）。
+
+        - 每个坐标对都经过与构造器相同的类型/越界校验，错误带 added_obstacles[i] 索引；
+        - 本批次内部重复抛 ValueError（不静默去重）；已是障碍的格子按集合并集保留
+          （幂等：重复声明一个本来就堵的格子不算新信息）；
+        - 全部校验通过后才构造新网格，失败不产生半更新对象。
+        """
+        if isinstance(cells, (str, bytes)) or not isinstance(cells, Iterable):
+            raise TypeError(f"cells 必须是 (x, y) 坐标对的可迭代对象，收到 {type(cells).__name__}")
+        merged: set[tuple[int, int]] = set(self._obstacles)
+        seen: set[tuple[int, int]] = set()
+        for i, raw in enumerate(cells):
+            cell = require_int_cell(f"added_obstacles[{i}]", raw, width=self._width, height=self._height)
+            if cell in seen:
+                raise ValueError(f"added_obstacles[{i}]={cell} 在本次更新中重复（不做静默去重）")
+            seen.add(cell)
+            merged.add(cell)
+        return Grid(self._width, self._height, merged)
+
     @property
     def width(self) -> int:
         return self._width

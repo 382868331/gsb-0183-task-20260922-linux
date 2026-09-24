@@ -12,9 +12,11 @@ from pose_grid_planner import (
     Grid,
     Heading,
     Pose,
+    ReplanningStatus,
     SearchStatus,
     plan,
     replay,
+    replan,
 )
 
 ARROW = {Heading.NORTH: "^", Heading.EAST: ">", Heading.SOUTH: "v", Heading.WEST: "<"}
@@ -105,10 +107,89 @@ def demo_rejection() -> None:
     assert no_path.status is SearchStatus.NO_PATH
 
 
+def demo_replanning() -> None:
+    print("\n=== 场景 3：执行前缀后收到静态障碍更新，保留前缀重新规划 ===")
+    # 9x5 空旷网格。旧路径 (1,2,E) -> (7,2,E)：6 次前进，代价 60。
+    grid = Grid(9, 5)
+    start = Pose(1, 2, Heading.EAST)
+    goal = Pose(7, 2, Heading.EAST)
+    first = plan(grid, start, goal)
+    assert first.status is SearchStatus.OPTIMAL
+    previous = first.plan
+    print(f"旧规划：{len(previous.actions)} 步，总代价 {previous.total_cost}（一路向东直行）")
+
+    # 执行了前 2 步，停在 (3,2,E)（占用 (3,2)(4,2)）；此时 (5,2) 新增静态障碍，
+    # 正好堵住剩余直线（下一步前进的扫掠并集会撞到 (5,2)）。
+    executed = 2
+    added = [(5, 2)]
+    print(f"已执行 {executed} 步 -> 当前 {Pose(3, 2, Heading.EAST)}；"
+          f"收到障碍更新 {added}")
+    r = replan(grid, start, goal, previous, executed=executed, added_obstacles=added)
+    assert r.status is ReplanningStatus.OPTIMAL
+    print(f"status={r.status.value}  剩余段 expansions={r.expansions}")
+    print(f"保留前缀: {[a.name for a in r.prefix.actions]}  代价 {r.prefix.total_cost}")
+    print(f"新剩余段: {' '.join(a.name for a in r.remaining.actions)}")
+    print(f"剩余段代价 {r.remaining.total_cost}（手算：6 次前进 60 + 4 次转向 32 = 92），"
+          f"完整路径代价 {r.plan.total_cost}（前缀 20 + 剩余 92）")
+
+    # 剩余段从当前位置在更新后的网格上重放；完整路径同样可整体重放（前缀扫掠区未被堵）
+    final, _ = replay(r.updated_grid, r.current_pose, r.remaining.actions)
+    assert final == goal
+    full_final, _ = replay(r.updated_grid, start, r.plan.actions)
+    assert full_final == goal
+    poses = [start] + [e.to_pose for e in r.plan.evidence]
+    print("更新后网格上的完整路径姿态（'#' 为新障碍）：")
+    print(render(r.updated_grid, poses))
+
+    # 更新无影响的情形：障碍只落在身后，剩余段应保持旧后缀不变
+    r2 = replan(grid, start, goal, previous, executed=2, added_obstacles=[(0, 2)])
+    assert r2.status is ReplanningStatus.OPTIMAL
+    assert r2.remaining.actions == previous.actions[2:]
+    print(f"[无影响] 障碍只加在身后 (0,2)：剩余段仍是旧后缀，代价 {r2.remaining.total_cost}")
+
+
+def demo_replan_failures() -> None:
+    print("\n=== 场景 4：重规划的实际失败边界 ===")
+    # 4a. 路径被堵死：9x1 直走廊，执行 2 步后前方 (6,0) 被堵，已证明无路可达
+    corridor = Grid(9, 1)
+    c_start, c_goal = Pose(0, 0, Heading.EAST), Pose(7, 0, Heading.EAST)
+    c_prev = plan(corridor, c_start, c_goal).plan
+    blocked = replan(corridor, c_start, c_goal, c_prev, executed=2, added_obstacles=[(6, 0)])
+    print(f"[无路可达] 走廊 (6,0) 被堵 -> status={blocked.status.value}"
+          f"（前缀 {len(blocked.prefix.actions)} 步保留，plan={blocked.plan}）")
+    assert blocked.status is ReplanningStatus.NO_PATH
+
+    # 4b. 更新直接压住机器人当前占用格：当前状态不安全，拒绝继续
+    crushed = replan(corridor, c_start, c_goal, c_prev, executed=2, added_obstacles=[(3, 0)])
+    print(f"[前缀受阻] 当前姿态占用 (2,0)(3,0)，(3,0) 被堵 -> status={crushed.status.value}")
+    assert crushed.status is ReplanningStatus.PREFIX_BLOCKED
+
+    # 4c. 非法更新批次：第 2 个坐标越界，整批失败，旧网格不发生任何改变
+    before = corridor.obstacles
+    try:
+        replan(corridor, c_start, c_goal, c_prev,
+               executed=2, added_obstacles=[(0, 0), (99, 0)])
+    except ValueError as exc:
+        print(f"[拒绝] 越界障碍批次 -> ValueError: {exc}")
+    assert corridor.obstacles == before
+
+    # 4d. 剩余搜索预算耗尽与无路可达严格区分
+    open_grid = Grid(9, 5)
+    d_start, d_goal = Pose(1, 2, Heading.EAST), Pose(7, 2, Heading.EAST)
+    d_prev = plan(open_grid, d_start, d_goal).plan
+    exhausted = replan(open_grid, d_start, d_goal, d_prev,
+                       executed=1, added_obstacles=[(5, 2)], max_expansions=0)
+    print(f"[预算] max_expansions=0 -> status={exhausted.status.value}"
+          f"（未找到也未证明无解，可加大预算重试）")
+    assert exhausted.status is ReplanningStatus.BUDGET_EXHAUSTED
+
+
 def main() -> None:
     t0 = time.perf_counter()
     demo_normal()
     demo_rejection()
+    demo_replanning()
+    demo_replan_failures()
     print(f"\n总用时 {time.perf_counter() - t0:.2f}s")
 
 

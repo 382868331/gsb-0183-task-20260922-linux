@@ -3,7 +3,8 @@
 公开接口：
     Grid, Heading, Pose, Action, StepEvidence, Plan,
     SearchStatus, SearchResult, plan, replay, ReplayError,
-    transition, successors, heuristic, MAX_GRID_SIDE
+    transition, successors, heuristic, MAX_GRID_SIDE,
+    ReplanningStatus, ReplanningResult, replan
 """
 
 from .model import (
@@ -25,6 +26,7 @@ from .planner import (
     plan,
     replay,
 )
+from .replanner import ReplanningResult, ReplanningStatus, replan
 
 __all__ = [
     "MAX_GRID_SIDE",
@@ -42,6 +44,9 @@ __all__ = [
     "heuristic",
     "plan",
     "replay",
+    "ReplanningResult",
+    "ReplanningStatus",
+    "replan",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
