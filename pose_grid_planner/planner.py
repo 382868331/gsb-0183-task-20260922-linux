@@ -25,6 +25,9 @@ class SearchStatus(enum.Enum):
     OPTIMAL = "optimal"  # 找到最优路径
     NO_PATH = "no_path"  # 已证明无解（开集耗尽）
     BUDGET_EXHAUSTED = "budget_exhausted"  # 搜索预算耗尽，既未找到也未证明无解
+    # 仅 timed_plan 使用：时域内开集耗尽，只证明“该时域内无路”，
+    # 不代表静态几何无解（静态几何是否可行须用无时间的 plan 另行判定）。
+    NO_PATH_IN_HORIZON = "no_path_in_horizon"
 
 
 @dataclass(frozen=True)
@@ -161,6 +164,8 @@ def replay(grid: Grid, start: Pose, actions: Tuple[Action, ...]) -> Tuple[Pose, 
     for i, action in enumerate(actions):
         if not isinstance(action, Action):
             raise ReplayError(f"actions[{i}] 必须是 Action，收到 {type(action).__name__}: {action!r}")
+        if action is Action.WAIT:
+            raise ReplayError(f"actions[{i}] 是 WAIT：无时间重放不支持等待，请使用 timed_replay")
         result = transition(grid, pose, action)
         if result is None:
             raise ReplayError(f"第 {i} 步 {action.name} 在姿态 {pose!r} 处扫掠不通过（越界或碰障碍）")

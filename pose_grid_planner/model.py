@@ -43,15 +43,25 @@ class Action(enum.Enum):
 
     注意：不能用代价做枚举值——TURN_LEFT/TURN_RIGHT 代价相同会被 Enum
     当作别名而吞掉一个成员。
+
+    WAIT 仅用于离散时间扩展（timed_* 接口）：耗时一步，代价不是固定常量，
+    由 timed_plan/timed_replay 的 wait_cost 参数（正整数）给出；无时间的
+    静态接口（transition/successors/plan/replay）明确拒绝 WAIT。
     """
 
     FORWARD = 0
     BACKWARD = 1
     TURN_LEFT = 2
     TURN_RIGHT = 3
+    WAIT = 4
 
     @property
     def cost(self) -> int:
+        if self is Action.WAIT:
+            raise ValueError(
+                "Action.WAIT 的代价不是固定常量：由 timed_plan/timed_replay 的 "
+                "wait_cost 参数（正整数）给出"
+            )
         return _ACTION_COSTS[self]
 
 
@@ -61,6 +71,9 @@ _ACTION_COSTS = {
     Action.TURN_LEFT: 8,
     Action.TURN_RIGHT: 8,
 }
+
+# 无时间静态接口只枚举四种运动原语；WAIT 只在 timed_* 接口中有意义。
+_MOTION_ACTIONS = (Action.FORWARD, Action.BACKWARD, Action.TURN_LEFT, Action.TURN_RIGHT)
 
 
 @dataclass(frozen=True)
@@ -212,22 +225,18 @@ class Grid:
         return f"Grid(width={self._width}, height={self._height}, obstacles={sorted(self._obstacles)!r})"
 
 
-def transition(grid: Grid, pose: Pose, action: Action) -> Optional[tuple[Pose, tuple[tuple[int, int], ...]]]:
-    """尝试执行一个原语。
+def _sweep(grid: Grid, pose: Pose, action: Action) -> tuple[Pose, tuple[tuple[int, int], ...]]:
+    """计算一个原语的（下一姿态, 扫掠格），不做任何可通过性检查。
 
-    返回 (下一姿态, 本步扫掠格) ；扫掠不通过（越界或碰障碍）返回 None。
     扫掠规则（题面契约）：
-    - 平移（前进/后退）：起终占用格的并集必须全空；
-    - 原地转向：包含起终全部占用格的最小轴对齐 2x2 矩形（4 格）必须全空。
+    - 平移（前进/后退）：起终占用格的并集；
+    - 原地转向：包含起终全部占用格的最小轴对齐 2x2 矩形（4 格）；
+    - WAIT：原地不动，扫掠 = 当前车体全部占用格（两格）。
+    这是唯一的扫掠几何入口，静态 transition 与离散时间 timed_transition 共用。
     """
-    if not isinstance(grid, Grid):
-        raise TypeError(f"grid 必须是 Grid，收到 {type(grid).__name__}: {grid!r}")
-    if not isinstance(pose, Pose):
-        raise TypeError(f"pose 必须是 Pose，收到 {type(pose).__name__}: {pose!r}")
-    if not isinstance(action, Action):
-        raise TypeError(f"action 必须是 Action，收到 {type(action).__name__}: {action!r}")
-
     h = pose.heading
+    if action is Action.WAIT:
+        return pose, grid.pose_cells(pose)
     if action is Action.FORWARD or action is Action.BACKWARD:
         sign = 1 if action is Action.FORWARD else -1
         nxt = Pose(pose.x + sign * h.dx, pose.y + sign * h.dy, h)
@@ -245,14 +254,36 @@ def transition(grid: Grid, pose: Pose, action: Action) -> Optional[tuple[Pose, t
             (pose.x + d_new[0], pose.y + d_new[1]),
             (pose.x + d_old[0] + d_new[0], pose.y + d_old[1] + d_new[1]),
         )
+    return nxt, swept
+
+
+def transition(grid: Grid, pose: Pose, action: Action) -> Optional[tuple[Pose, tuple[tuple[int, int], ...]]]:
+    """尝试执行一个原语（无时间静态语义）。
+
+    返回 (下一姿态, 本步扫掠格) ；扫掠不通过（越界或碰障碍）返回 None。
+    扫掠规则见 _sweep。WAIT 属于离散时间扩展，这里明确拒绝。
+    """
+    if not isinstance(grid, Grid):
+        raise TypeError(f"grid 必须是 Grid，收到 {type(grid).__name__}: {grid!r}")
+    if not isinstance(pose, Pose):
+        raise TypeError(f"pose 必须是 Pose，收到 {type(pose).__name__}: {pose!r}")
+    if not isinstance(action, Action):
+        raise TypeError(f"action 必须是 Action，收到 {type(action).__name__}: {action!r}")
+    if action is Action.WAIT:
+        raise ValueError("Action.WAIT 仅用于离散时间接口（timed_transition/timed_plan/timed_replay）")
+
+    nxt, swept = _sweep(grid, pose, action)
     if all(grid.is_free(c) for c in swept):
         return nxt, swept
     return None
 
 
 def successors(grid: Grid, pose: Pose) -> Iterator[tuple[Action, Pose, tuple[tuple[int, int], ...], int]]:
-    """枚举姿态的全部合法后继：(动作, 下一姿态, 扫掠格, 代价)。"""
-    for action in Action:
+    """枚举姿态的全部合法后继：(动作, 下一姿态, 扫掠格, 代价)。
+
+    只枚举四种运动原语（无时间语义下 WAIT 无意义，不会产出）。
+    """
+    for action in _MOTION_ACTIONS:
         result = transition(grid, pose, action)
         if result is not None:
             nxt, swept = result
