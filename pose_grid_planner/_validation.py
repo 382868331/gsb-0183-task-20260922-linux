@@ -27,6 +27,20 @@ def require_int(name: str, value: Any) -> int:
     return value
 
 
+def require_int_pair(name: str, value: Any) -> tuple[int, int]:
+    """要求 value 是长度恰为 2 的整数坐标对（不做界内校验）。
+
+    用于构造期还没有 Grid 宽高的场景（如 Timetable）：界内检查由使用方
+    拿到 Grid 后负责（见 plan_timed 入口）。
+    """
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        raise TypeError(f"{name} 必须是 (x, y) 坐标对，收到 {type(value).__name__}: {value!r}")
+    items = list(value)
+    if len(items) != 2:
+        raise ValueError(f"{name} 必须恰好包含 2 个整数坐标，收到 {len(items)} 个: {value!r}")
+    return require_int(f"{name}[0]", items[0]), require_int(f"{name}[1]", items[1])
+
+
 def require_int_cell(name: str, cell: Any, *, width: int, height: int) -> tuple[int, int]:
     """要求 cell 是长度恰为 2 的整数坐标对，且落在 [0,width)×[0,height) 内。"""
     if isinstance(cell, (str, bytes)) or not isinstance(cell, Iterable):

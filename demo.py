@@ -1,4 +1,4 @@
-"""固定输入演示：真实计算一条带扫掠证据的路径并重放验证，再实际触发一个拒绝边界。
+"""固定输入演示：真实计算静态与时序路径并重放验证，再实际触发拒绝/失败边界。
 
 运行：python demo.py   （纯标准库，离线，无 sleep、无预录结果）
 """
@@ -13,8 +13,11 @@ from pose_grid_planner import (
     Heading,
     Pose,
     SearchStatus,
+    Timetable,
     plan,
+    plan_timed,
     replay,
+    replay_timed,
 )
 
 ARROW = {Heading.NORTH: "^", Heading.EAST: ">", Heading.SOUTH: "v", Heading.WEST: "<"}
@@ -105,10 +108,75 @@ def demo_rejection() -> None:
     assert no_path.status is SearchStatus.NO_PATH
 
 
+def demo_timed_normal() -> None:
+    print("\n=== 场景 3：离散时间——窄路临时占用，等待让行 ===")
+    grid = Grid(6, 1)  # 6x1 走廊，无法转向
+    start = Pose(2, 0, Heading.EAST)  # 车身 (2,0),(3,0)
+    goal = Pose(4, 0, Heading.EAST)  # 车身 (4,0),(5,0)
+    # 宽障碍在 t=2,3 占据走廊东段；前进/原地等待都会被堵死，唯一活路是先倒车
+    tt = Timetable({2: [(3, 0), (4, 0), (5, 0)], 3: [(3, 0), (4, 0), (5, 0)]})
+    print(f"grid={grid.width}x{grid.height}（1 格宽走廊）  start={start}  goal={goal}")
+    print("禁占格 t=2,3: (3,0),(4,0),(5,0)；其余时刻畅通。horizon=10, wait_cost=1")
+
+    t0 = time.perf_counter()
+    result = plan_timed(grid, tt, start, goal, horizon=10)
+    elapsed = time.perf_counter() - t0
+    assert result.status is SearchStatus.OPTIMAL, result.status
+    p = result.plan
+    print(f"status={result.status.value}  expansions={result.expansions}  "
+          f"total_cost={p.total_cost}  到达时刻 t={result.arrival_time}  用时={elapsed * 1000:.1f}ms")
+    print("动作序列:", " ".join(a.name for a in p.actions))
+    print("逐步占用证据（每步扫掠格 vs blocked[t]∪blocked[t+1]，交集必须为空）:")
+    for i, e in enumerate(p.evidence):
+        ban = sorted(set(tt.blocked_at(i)) | set(tt.blocked_at(i + 1)))
+        assert not (set(e.swept_cells) & set(ban)), (i, e.swept_cells, ban)
+        body_now = sorted(grid.pose_cells(e.from_pose))
+        print(f"  step {i}: t={e.time} {e.action.name:<11} {e.from_pose} -> {e.to_pose}  "
+              f"cost={e.cost}  本步前车体={body_now}  扫掠={sorted(e.swept_cells)}  禁占并集={ban}")
+
+    # 重放验证：逐步重新执行空间扫掠 + 起止时刻禁占检查
+    final_state, evidence = replay_timed(grid, tt, start, p.actions)
+    assert final_state.pose == goal and final_state.time == result.arrival_time
+    assert sum(e.cost for e in evidence) == p.total_cost
+    print(f"重放验证通过：{final_state.time} 步后到达 {final_state.pose}，无碰撞、无禁占冲突。")
+
+
+def demo_timed_failure() -> None:
+    print("\n=== 场景 4：离散时间失败示例——终点稍后被封 & 时域不足 ===")
+    grid = Grid(4, 1)
+    start = Pose(0, 0, Heading.EAST)
+    goal = Pose(2, 0, Heading.EAST)
+
+    # 4a. 终点从 t=1 起一直被封：时域内任何到达都撞禁占 → NO_PATH_WITHIN_HORIZON
+    sealed = Timetable({t: [(2, 0), (3, 0)] for t in range(1, 8)})
+    r = plan_timed(grid, sealed, start, goal, horizon=7)
+    print(f"[时域无路] 终点 t>=1 被封 -> status={r.status.value}（expansions={r.expansions}）")
+    # 同一几何静态规划有路：不能把时域无路报成静态几何无路
+    r_static = plan(grid, start, goal)
+    print(f"[几何有路] 忽略时刻表的静态 plan -> status={r_static.status.value} "
+          f"cost={r_static.plan.total_cost}")
+    assert r.status is SearchStatus.NO_PATH_WITHIN_HORIZON
+    assert r.plan is None
+    assert r_static.status is SearchStatus.OPTIMAL
+
+    # 4b. 时域太短（到目标至少 2 步，只给 1 步）同样只报时域内无路
+    r_short = plan_timed(grid, Timetable({}), start, goal, horizon=1)
+    print(f"[时域不足] horizon=1 而至少需要 2 步 -> status={r_short.status.value}")
+    assert r_short.status is SearchStatus.NO_PATH_WITHIN_HORIZON
+
+    # 4c. 起刻车身被禁占：构造期不静默纠正，调用处给可定位 ValueError
+    try:
+        plan_timed(grid, Timetable({0: [(1, 0)]}), start, goal, horizon=4)
+    except ValueError as exc:
+        print(f"[拒绝] start 占用格在 t=0 被禁占 -> ValueError: {exc}")
+
+
 def main() -> None:
     t0 = time.perf_counter()
     demo_normal()
     demo_rejection()
+    demo_timed_normal()
+    demo_timed_failure()
     print(f"\n总用时 {time.perf_counter() - t0:.2f}s")
 
 

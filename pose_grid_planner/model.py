@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
-from typing import Iterable, Iterator, Optional, Tuple
+from typing import Iterable, Iterator, Mapping, Optional, Tuple
 
-from ._validation import require_int, require_int_cell
+from ._validation import require_int, require_int_cell, require_int_pair
 
 MAX_GRID_SIDE = 20  # 题面上限：障碍格不超过 20×20
+
+# WAIT（原地等待一个时刻）的默认代价。等待代价必须是正整数；plan_timed /
+# replay_timed 可用 wait_cost 关键字指定其他正整数。
+DEFAULT_WAIT_COST = 1
 
 
 class Heading(enum.IntEnum):
@@ -49,6 +53,7 @@ class Action(enum.Enum):
     BACKWARD = 1
     TURN_LEFT = 2
     TURN_RIGHT = 3
+    WAIT = 4  # 原地等待一个时刻：位置/朝向不变，耗时 1 步，代价为正整数
 
     @property
     def cost(self) -> int:
@@ -60,6 +65,7 @@ _ACTION_COSTS = {
     Action.BACKWARD: 14,
     Action.TURN_LEFT: 8,
     Action.TURN_RIGHT: 8,
+    Action.WAIT: DEFAULT_WAIT_COST,
 }
 
 
@@ -85,13 +91,18 @@ class Pose:
 
 @dataclass(frozen=True)
 class StepEvidence:
-    """单步扫掠证据：动作、起终姿态、本步检查过的全部格子、该步代价。"""
+    """单步扫掠证据：动作、起终姿态、本步检查过的全部格子、该步代价。
+
+    time 为该步的起始时刻（动作从 time 执行到 time+1）；静态（无时刻表）
+    接口下 time 为 None。
+    """
 
     action: Action
     from_pose: Pose
     to_pose: Pose
     swept_cells: Tuple[tuple[int, int], ...]
     cost: int
+    time: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +118,114 @@ class Plan:
         if not self.evidence:
             raise ValueError("空路径没有 final_pose（起终相同，请直接使用起点姿态）")
         return self.evidence[-1].to_pose
+
+
+@dataclass(frozen=True)
+class TimedState:
+    """时序搜索状态：位置 + 朝向 + 时刻。
+
+    同一位置同一朝向、不同时刻是不同状态，不能合并——禁占格随时刻变化。
+    """
+
+    x: int
+    y: int
+    heading: Heading
+    time: int
+
+    def __post_init__(self) -> None:
+        require_int("TimedState.x", self.x)
+        require_int("TimedState.y", self.y)
+        if isinstance(self.heading, bool) or not isinstance(self.heading, Heading):
+            raise TypeError(
+                f"TimedState.heading 必须是 Heading 枚举，收到 {type(self.heading).__name__}: {self.heading!r}"
+            )
+        require_int("TimedState.time", self.time)
+        if self.time < 0:
+            raise ValueError(f"TimedState.time 必须 >= 0，收到 {self.time}")
+
+    @property
+    def pose(self) -> Pose:
+        return Pose(self.x, self.y, self.heading)
+
+    @classmethod
+    def from_pose(cls, pose: Pose, time: int) -> "TimedState":
+        return cls(pose.x, pose.y, pose.heading, time)
+
+
+class Timetable:
+    """有限时域内各时刻的禁占格（临时障碍），不可变。
+
+    blocked_by_time[t] 为时刻 t 禁占的格子集合；动作从 t 执行到 t+1 时，
+    扫掠必须避开 blocked[t] ∪ blocked[t+1]。只给出显式列出的时刻，
+    未列出的时刻没有禁占格（静态障碍仍由 Grid 负责）。
+    """
+
+    __slots__ = ("_blocked", "_horizon")
+
+    def __init__(self, blocked_by_time: Mapping[int, Iterable[tuple[int, int]]]) -> None:
+        if isinstance(blocked_by_time, (str, bytes)) or not isinstance(blocked_by_time, Mapping):
+            raise TypeError(
+                f"blocked_by_time 必须是 {{时刻: (x, y) 可迭代对象}} 的映射，"
+                f"收到 {type(blocked_by_time).__name__}"
+            )
+        by_time: dict[int, frozenset[tuple[int, int]]] = {}
+        horizon = -1
+        for raw_t, cells in blocked_by_time.items():
+            t = require_int("blocked_by_time 的时刻键", raw_t)
+            if t < 0:
+                raise ValueError(f"blocked_by_time 的时刻必须 >= 0，收到 {t}")
+            if isinstance(cells, (str, bytes)) or not isinstance(cells, Iterable):
+                raise TypeError(
+                    f"blocked_by_time[{t}] 必须是 (x, y) 坐标对的可迭代对象，"
+                    f"收到 {type(cells).__name__}"
+                )
+            bucket: set[tuple[int, int]] = set()
+            for i, raw_cell in enumerate(cells):
+                cell = require_int_pair(f"blocked_by_time[{t}][{i}]", raw_cell)
+                if cell in bucket:
+                    raise ValueError(
+                        f"blocked_by_time[{t}][{i}]={cell} 在同一时刻重复（不做静默去重）"
+                    )
+                bucket.add(cell)
+            if bucket:
+                by_time[t] = frozenset(bucket)
+                horizon = max(horizon, t)
+        self._blocked = by_time
+        self._horizon = horizon  # 出现过禁占格的最大时刻；无任何禁占格时为 -1
+
+    @property
+    def horizon(self) -> int:
+        """出现过禁占格的最大时刻（空时刻表为 -1）。"""
+        return self._horizon
+
+    def blocked_at(self, time: int) -> frozenset[tuple[int, int]]:
+        """某一时刻的禁占格集合（未列出的时刻为空集）。"""
+        return self._blocked.get(time, frozenset())
+
+    def is_blocked(self, cell: tuple[int, int], time: int) -> bool:
+        return cell in self._blocked.get(time, frozenset())
+
+    def sweep_blocked(
+        self, swept: Iterable[tuple[int, int]], t: int
+    ) -> Optional[tuple[tuple[int, int], int]]:
+        """扫掠格与 blocked[t] ∪ blocked[t+1] 的第一个冲突 (格, 时刻)；无冲突返回 None。"""
+        b0 = self._blocked.get(t, frozenset())
+        b1 = self._blocked.get(t + 1, frozenset())
+        for cell in swept:
+            if cell in b0:
+                return cell, t
+            if cell in b1:
+                return cell, t + 1
+        return None
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Timetable) and self._blocked == other._blocked
+
+    def __hash__(self) -> int:
+        return hash(tuple(sorted(self._blocked.items())))
+
+    def __repr__(self) -> str:
+        return f"Timetable({ {t: sorted(c) for t, c in sorted(self._blocked.items())}!r})"
 
 
 class Grid:
@@ -212,13 +331,23 @@ class Grid:
         return f"Grid(width={self._width}, height={self._height}, obstacles={sorted(self._obstacles)!r})"
 
 
+# 空间运动原语（不含 WAIT）：静态规划与静态 successors 只枚举这四个。
+SPATIAL_ACTIONS: Tuple[Action, ...] = (
+    Action.FORWARD,
+    Action.BACKWARD,
+    Action.TURN_LEFT,
+    Action.TURN_RIGHT,
+)
+
+
 def transition(grid: Grid, pose: Pose, action: Action) -> Optional[tuple[Pose, tuple[tuple[int, int], ...]]]:
-    """尝试执行一个原语。
+    """尝试执行一个原语（纯空间检查，不含时刻表）。
 
     返回 (下一姿态, 本步扫掠格) ；扫掠不通过（越界或碰障碍）返回 None。
     扫掠规则（题面契约）：
     - 平移（前进/后退）：起终占用格的并集必须全空；
-    - 原地转向：包含起终全部占用格的最小轴对齐 2x2 矩形（4 格）必须全空。
+    - 原地转向：包含起终全部占用格的最小轴对齐 2x2 矩形（4 格）必须全空；
+    - 等待（WAIT）：姿态不变，车体当前占用的全部两格必须全空。
     """
     if not isinstance(grid, Grid):
         raise TypeError(f"grid 必须是 Grid，收到 {type(grid).__name__}: {grid!r}")
@@ -228,7 +357,10 @@ def transition(grid: Grid, pose: Pose, action: Action) -> Optional[tuple[Pose, t
         raise TypeError(f"action 必须是 Action，收到 {type(action).__name__}: {action!r}")
 
     h = pose.heading
-    if action is Action.FORWARD or action is Action.BACKWARD:
+    if action is Action.WAIT:
+        nxt = pose
+        swept = grid.pose_cells(pose)  # 等待也要检查车体全部格
+    elif action is Action.FORWARD or action is Action.BACKWARD:
         sign = 1 if action is Action.FORWARD else -1
         nxt = Pose(pose.x + sign * h.dx, pose.y + sign * h.dy, h)
         swept = tuple(dict.fromkeys(grid.pose_cells(pose) + grid.pose_cells(nxt)))
@@ -251,9 +383,64 @@ def transition(grid: Grid, pose: Pose, action: Action) -> Optional[tuple[Pose, t
 
 
 def successors(grid: Grid, pose: Pose) -> Iterator[tuple[Action, Pose, tuple[tuple[int, int], ...], int]]:
-    """枚举姿态的全部合法后继：(动作, 下一姿态, 扫掠格, 代价)。"""
-    for action in Action:
+    """枚举姿态的全部合法空间后继：(动作, 下一姿态, 扫掠格, 代价)。
+
+    只含四个空间原语；WAIT 只属于离散时间接口（见 timed_successors）。
+    """
+    for action in SPATIAL_ACTIONS:
         result = transition(grid, pose, action)
         if result is not None:
             nxt, swept = result
             yield action, nxt, swept, action.cost
+
+
+def timed_transition(
+    grid: Grid,
+    timetable: Timetable,
+    state: TimedState,
+    action: Action,
+) -> Optional[tuple[TimedState, tuple[tuple[int, int], ...]]]:
+    """在时刻 state.time 尝试执行一个原语（耗时 1 步，含 WAIT）。
+
+    先做与 transition 相同的空间扫掠检查，再要求扫掠格全部避开
+    blocked[t] ∪ blocked[t+1]（t 为起始时刻）。任一不通过返回 None；
+    通过则返回 (下一状态, 扫掠格)，下一状态时刻为 t+1。
+    """
+    if not isinstance(grid, Grid):
+        raise TypeError(f"grid 必须是 Grid，收到 {type(grid).__name__}: {grid!r}")
+    if not isinstance(timetable, Timetable):
+        raise TypeError(f"timetable 必须是 Timetable，收到 {type(timetable).__name__}: {timetable!r}")
+    if not isinstance(state, TimedState):
+        raise TypeError(f"state 必须是 TimedState，收到 {type(state).__name__}: {state!r}")
+    if not isinstance(action, Action):
+        raise TypeError(f"action 必须是 Action，收到 {type(action).__name__}: {action!r}")
+
+    result = transition(grid, state.pose, action)
+    if result is None:
+        return None
+    nxt_pose, swept = result
+    if timetable.sweep_blocked(swept, state.time) is not None:
+        return None
+    return TimedState.from_pose(nxt_pose, state.time + 1), swept
+
+
+def timed_successors(
+    grid: Grid,
+    timetable: Timetable,
+    state: TimedState,
+    *,
+    wait_cost: int = DEFAULT_WAIT_COST,
+) -> Iterator[tuple[Action, TimedState, tuple[tuple[int, int], ...], int]]:
+    """枚举时序状态的全部合法后继：(动作, 下一状态, 扫掠格, 代价)。
+
+    四个空间原语之外增加 WAIT（代价 wait_cost，正整数）。
+    """
+    wait_cost = require_int("wait_cost", wait_cost)
+    if wait_cost < 1:
+        raise ValueError(f"wait_cost 必须是正整数，收到 {wait_cost}")
+    for action in Action:
+        result = timed_transition(grid, timetable, state, action)
+        if result is not None:
+            nxt, swept = result
+            cost = wait_cost if action is Action.WAIT else action.cost
+            yield action, nxt, swept, cost
