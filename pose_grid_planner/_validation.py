@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable
+from numbers import Real
 from typing import Any
 
 
@@ -24,6 +25,32 @@ def require_int(name: str, value: Any) -> int:
         raise TypeError(f"{name} 必须是 int，收到 float（不做隐式取整）: {value!r}")
     if not isinstance(value, int):
         raise TypeError(f"{name} 必须是 int，收到 {type(value).__name__}: {value!r}")
+    return value
+
+
+def require_finite_real(name: str, value: Any) -> float:
+    """要求有限实数；拒绝 bool、NaN/Infinity 和非数值类型。"""
+    if isinstance(value, bool):
+        raise TypeError(f"{name} 必须是实数，不能是 bool: {value!r}")
+    if not isinstance(value, Real):
+        raise TypeError(f"{name} 必须是实数，收到 {type(value).__name__}: {value!r}")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"{name} 不能是 NaN 或 Infinity: {value!r}")
+    return value
+
+
+def require_non_negative_real(name: str, value: Any) -> float:
+    value = require_finite_real(name, value)
+    if value < 0:
+        raise ValueError(f"{name} 不能为负数: {value!r}")
+    return value
+
+
+def require_positive_real(name: str, value: Any) -> float:
+    value = require_finite_real(name, value)
+    if value <= 0:
+        raise ValueError(f"{name} 必须大于 0: {value!r}")
     return value
 
 

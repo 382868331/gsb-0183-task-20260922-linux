@@ -2,6 +2,8 @@
 
 离线移动机器人工程用可复用库：在障碍格上为“占两格、四朝向”的机器人做
 A* 姿态格规划，每个运动原语都带车体扫掠检查，输出动作序列与逐步扫掠证据。
+本次增量提供 `time_parameterize`：在几何路径已经验证的前提下，按速度、
+切向加/减速度和横向加速度限制安排离散路径的时间曲线。
 
 ## 运行环境
 
@@ -11,9 +13,15 @@ A* 姿态格规划，每个运动原语都带车体扫掠检查，输出动作�
 ## 快速开始
 
 ```bash
-python -m unittest discover -s tests -v   # 运行全部测试（含独立 Dijkstra 对照）
-python demo.py                            # 固定输入演示：正常规划 + 实际触发的拒绝边界
+python -m venv .venv
+source .venv/bin/activate
+python -m unittest discover -s tests -v
+python demo_iteration.py
 ```
+
+`requirements.txt` 为空，venv 中不需要 `pip install`。原碰撞规划演示仍可用
+`python demo.py` 运行；时间参数化演示 `demo_iteration.py` 现场计算，通常 1 秒内完成，
+远低于 90 秒限制，不使用 sleep、网络或预存答案。
 
 ## 问题契约
 
@@ -41,6 +49,9 @@ from pose_grid_planner import (
     Plan, StepEvidence,                     # 路径与逐步证据
     transition, successors, heuristic,      # 单步原语 / 后继 / 启发式
     ReplayError, MAX_GRID_SIDE,
+    time_parameterize,                      # 时间参数化
+    TimeParameterization, SpeedConstraint,  # 时间结果与限制来源
+    TimeParameterizationError,              # 不可行边界
 )
 ```
 
@@ -57,6 +68,43 @@ from pose_grid_planner import (
   任一步扫掠不通过抛 `ReplayError`（带步序号，可定位）。
 - `transition(grid, pose, action)`：单步执行，返回 `(下一姿态, 扫掠格)` 或 `None`。
 
+### 时间参数化
+
+```python
+result = time_parameterize(
+    path,                    # 已验证离散路径；本函数只使用节点数量，不重新做碰撞规划
+    segment_lengths,         # 每段长度，长度必须为非负有限实数
+    curvature_bounds,        # 每段曲率上界 kappa，0 表示直线段
+    max_speed=10.0,
+    acceleration=2.0,        # 最大切向加速度
+    deceleration=2.0,        # 最大切向减速度（按正数输入）
+    lateral_acceleration=2.0,
+    start_speed=0.0,         # 调用方固定给定，不可被静默降低
+    end_speed=0.0,           # 调用方固定给定，不可被静默抬升/降低
+)
+```
+
+计算顺序是：
+
+1. 节点初速上界取 `max_speed` 与所有相邻非零段的
+   `sqrt(lateral_acceleration / curvature_bound)` 的最小值；
+2. 正向传播平方速度约束 `v[i+1]^2 <= v[i]^2 + 2*a*s`；
+3. 反向传播平方速度约束 `v[i]^2 <= v[i+1]^2 + 2*d*s`；
+4. 校验固定起终速度在可用距离内可达，不可行则抛 `TimeParameterizationError`。
+
+返回 `TimeParameterization`：
+
+- `velocities`：每个原始节点的速度；
+- `segment_durations`：每个原始段的最短通过时间；
+- `segment_accelerations`：每个非零原始段使用的恒定切向加速度；
+- `arrival_times`：每个原始节点的累计到达时间；
+- `limiting_constraints`：每个节点最终速度的限制来源集合；并列生效时全部列出；
+- `node_group_indices`：零长段合并后的节点组映射，原始节点数量和顺序不变。
+
+零长段会把相邻节点合并为同一速度组，但返回数组仍按原始节点/段索引给出；
+零长段自身时间为 0，其曲率不产生额外约束。段模型为**分段恒定切向加速度**，
+段时间由 `t = 2s / (v0 + v1)` 精确定义；本模块不声称考虑 jerk。
+
 ## 错误语义
 
 - 整数参数拒绝 `bool`（`TypeError`）；`float` 不隐式取整（`TypeError`）；
@@ -68,8 +116,13 @@ from pose_grid_planner import (
 
 ## 误差口径
 
-全部计算（代价、启发式、坐标）均为**精确整数运算**，无浮点结果，
+碰撞规划全部计算（代价、启发式、坐标）均为**精确整数运算**，无浮点结果，
 因此无数值误差；路径代价可与独立参考逐点相等性比较（测试即如此断言）。
+
+时间参数化使用 IEEE 754 双精度浮点。速度来自平方根，测试对手算值使用
+`1e-10` 量级容差；独立参考按 2000 个子段复核距离和速度约束，并用分段恒定
+加速度的闭式积分对照时间。约束复核另留 `1e-10` 的数值余量。该容差只用于
+浮点表示误差，不用于把不可行的固定起终速度改成可行。
 
 ## 设计取舍
 
@@ -82,6 +135,9 @@ from pose_grid_planner import (
 - **测试独立参考**：`tests/dijkstra_reference.py` 不导入被测包，按题面契约
   重新推导占用/扫掠规则做全状态 Dijkstra，与 A* 在确定性随机场景（含 20×20 上限）
   对照最优代价与有/无解判定；往返一致性（重放）仅作补充检查。
+- **时间曲线独立复核**：直线和恒曲率弯道均与手算速度/时间对照；测试还按
+  分段恒定加速度独立积分距离，并逐段检查最大速度、横向加速度、切向加/减速度。
+  时间参数化不重新运行碰撞规划，也不加入实时控制器。
 
 ## 已知限制
 
@@ -90,11 +146,18 @@ from pose_grid_planner import (
 - 网格上限 20×20 为接口边界，超限构造即 `ValueError`。
 - 代价固定为 10/14/8，不可配置（题面契约）；需要其他代价体系请改 `Action.cost` 表。
 - 转向扫掠按“最小轴对齐 2×2”近似真实车体扫掠，不建模连续几何。
+- 时间参数化假定输入路径、段长和曲率上界已经由调用方验证；它不重算几何、
+  不检查碰撞，也不处理实时控制跟踪。
+- 时间模型只包含分段恒定切向加速度，不建模 jerk、转向速度变化、驱动器动态
+  或曲率段内变化；曲率上界按该段两端节点施加横向限速。
+- 起终速度是硬边界：超过曲率/最大速度上界，或距离不足以按规定加/减速度到达，
+  都直接拒绝，不会自动改成“更接近”的速度。
 
 ## 目录结构
 
 ```
-pose_grid_planner/     # 库：model.py（数据结构+原语） planner.py（A*+重放） _validation.py
-tests/                 # unittest 测试 + dijkstra_reference.py（独立参考，不调用被测核心）
-demo.py                # 固定输入演示（真实计算，无 sleep/预录）
+pose_grid_planner/     # 库：model.py、planner.py、time_parameterization.py、_validation.py
+tests/                 # unittest 测试 + Dijkstra/数值积分独立参考
+demo.py                # 原碰撞规划固定输入演示（真实计算，无 sleep/预录）
+demo_iteration.py      # 时间参数化演示：直线、恒曲率弯道、实际拒绝边界
 ```

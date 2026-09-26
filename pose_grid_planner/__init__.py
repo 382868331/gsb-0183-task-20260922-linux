@@ -25,6 +25,12 @@ from .planner import (
     plan,
     replay,
 )
+from .time_parameterization import (
+    SpeedConstraint,
+    TimeParameterization,
+    TimeParameterizationError,
+    time_parameterize,
+)
 
 __all__ = [
     "MAX_GRID_SIDE",
@@ -42,6 +48,10 @@ __all__ = [
     "heuristic",
     "plan",
     "replay",
+    "SpeedConstraint",
+    "TimeParameterization",
+    "TimeParameterizationError",
+    "time_parameterize",
 ]
 
 __version__ = "1.0.0"
