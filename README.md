@@ -1,7 +1,8 @@
-# pose-grid-planner：带车体扫掠检查的姿态格路径规划
+# pose-grid-planner：带拖车姿态与扫掠检查的姿态格规划
 
-离线移动机器人工程用可复用库：在障碍格上为“占两格、四朝向”的机器人做
-A* 姿态格规划，每个运动原语都带车体扫掠检查，输出动作序列与逐步扫掠证据。
+离线移动机器人工程用可复用库：在障碍格上为“占两格、四朝向”的牵引车做 A*
+姿态格规划，并在同一离散模型中加入一节拖车。搜索状态始终包含牵引车与拖车朝向；
+每个原语分别保留牵引车、拖车和连接杆的保守扫掠证据。原有单车接口与测试继续保留。
 
 ## 运行环境
 
@@ -11,9 +12,15 @@ A* 姿态格规划，每个运动原语都带车体扫掠检查，输出动作�
 ## 快速开始
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
+python --version    # 期望 3.14.7；仅标准库，requirements.txt 无需安装第三方包
 python -m unittest discover -s tests -v   # 运行全部测试（含独立 Dijkstra 对照）
-python demo.py                            # 固定输入演示：正常规划 + 实际触发的拒绝边界
+python demo.py                            # 旧单车接口演示
+python demo_iteration.py                  # 新拖车场景 + 预算/无路边界，90 秒内完成
 ```
+
+也可不激活虚拟环境，直接使用系统的 Python 3.14.7 运行上述命令；不使用 Docker、数据库、在线服务或真实凭据。
 
 ## 问题契约
 
@@ -57,6 +64,30 @@ from pose_grid_planner import (
   任一步扫掠不通过抛 `ReplayError`（带步序号，可定位）。
 - `transition(grid, pose, action)`：单步执行，返回 `(下一姿态, 扫掠格)` 或 `None`。
 
+## 铰接拖车模型
+
+- 新状态为 `ArticulatedPose(x, y, tractor_heading, trailer_heading)`。
+- `(x,y)` 是牵引车后方连接点 hitch：牵引车占用 hitch 与沿牵引车朝向前一格；拖车占用 hitch 与沿拖车朝向反方向的车轴格。
+- 最大铰接角为一个 90° 档位：`MAX_ARTICULATION_TURNS = 1`；超过该角度的转向直接不可用。
+- 动作仍只有四个旧原语，代价固定为非负整数：前进 10、倒车 14、左右转 8。
+- 前进一格：hitch 沿牵引车朝向移动，离散后的新拖车朝向等于牵引车朝向；倒车只在车列已直时可用；原地转向只改变牵引车朝向。
+- 前进拉直经过角点时，拖车与连接杆使用保守 2×2 包围盒，防止切墙；证据分别给出 `tractor_swept_cells`、`trailer_swept_cells`、`hitch_bar_swept_cells`。
+- `plan_articulated()` 搜索完整状态 `(x,y,tractor_heading,trailer_heading)`，不是先找单车路径再事后检查拖车碰撞。
+
+```python
+from pose_grid_planner import (
+    ArticulatedPose, ArticulatedPlan, ArticulatedStepEvidence,
+    ArticulatedSearchResult, MAX_ARTICULATION_TURNS,
+    plan_articulated, replay_articulated, articulated_heuristic,
+    articulated_transition, articulated_successors,
+)
+
+result = plan_articulated(grid, start, goal, max_expansions=None)
+```
+
+`ArticulatedStepEvidence.swept_cells` 返回三类扫掠格的去重并集；`replay_articulated()`
+逐步复核铰接角、越界、障碍和连接杆扫掠，失败抛带步序号的 `ReplayError`。
+
 ## 错误语义
 
 - 整数参数拒绝 `bool`（`TypeError`）；`float` 不隐式取整（`TypeError`）；
@@ -65,6 +96,8 @@ from pose_grid_planner import (
   不静默纠正、不静默去重。
 - 库不持有全局/跨调用状态：`Grid` 不可变，`plan` 纯函数式，
   不存在“失败后留下部分变更”的批次操作。
+- 拖车起终若为 180° 铰接、越界或占用障碍，抛 `ValueError`；搜索中越过铰接界限不是异常，而是该动作不产生后继。
+- `max_expansions=0` 在扩展前返回 `BUDGET_EXHAUSTED`；完整搜索开集耗尽才是 `NO_PATH`。
 
 ## 误差口径
 
@@ -73,28 +106,28 @@ from pose_grid_planner import (
 
 ## 设计取舍
 
-- **A\* + 一致性启发式 + closed 集（best_g）**：状态数最多 20×20×4=1600，
-  无需双向搜索等复杂手段；启发式按题面契约只用两个分量的 max。
+- **A\* + closed 集（best_g）**：单车状态数最多 20×20×4=1600，铰接车状态数最多 20×20×4×4=6400。
+- 单车启发式按题面契约使用曼哈顿与最少转向代价的 max；拖车启发式只使用 hitch 曼哈顿平移下界，以保证在前进/倒车/转向边下一致。
 - **扫掠证据随路径输出**：`transition()` 是唯一的扫掠判定入口，规划与重放共用，
   证据即每步实际检查过的格子集合，可独立复核。
 - **预算语义**：`max_expansions` 限制“弹出扩展”的状态数；预算触顶单独返回
   `BUDGET_EXHAUSTED`，调用方可据此加大预算重试，而不会误读为无解。
-- **测试独立参考**：`tests/dijkstra_reference.py` 不导入被测包，按题面契约
-  重新推导占用/扫掠规则做全状态 Dijkstra，与 A* 在确定性随机场景（含 20×20 上限）
-  对照最优代价与有/无解判定；往返一致性（重放）仅作补充检查。
+- **独立参考**：`tests/dijkstra_reference.py` 与 `tests/articulated_dijkstra_reference.py`
+  均不导入被测包。拖车测试覆盖窄转角单车可过/挂车无路、必须先拉直再倒车、逐步铰接角与三类扫掠、预算/无路分离，并用随机小网格做全状态 Dijkstra 对照。
 
 ## 已知限制
 
-- 仅实现题面契约的四朝向、两格占用、四种原语；不是通用运动规划器，
-  不宣称兼容任何行业标准（如完整 lattice planner / Hybrid A*）。
+- 仅实现 cardinal 姿态格、两格车体、一节一格杆长拖车和四种原语；不是连续角度通用运动规划器，不宣称兼容完整 lattice planner / Hybrid A*。
+- 当前离散拖车前进会在一格动作结束时拉直为牵引车朝向；中间连续角只用保守 2×2 格子扫掠包络，不输出连续轨迹。倒车的有限 cardinal 后继要求进入动作前车列已直。
 - 网格上限 20×20 为接口边界，超限构造即 `ValueError`。
 - 代价固定为 10/14/8，不可配置（题面契约）；需要其他代价体系请改 `Action.cost` 表。
-- 转向扫掠按“最小轴对齐 2×2”近似真实车体扫掠，不建模连续几何。
+- 转向和铰接扫掠按轴对齐 2×2/起终并集做保守格子近似，不建模真实车辆尺寸、轮胎轨迹、速度或多节挂车。
 
 ## 目录结构
 
 ```
 pose_grid_planner/     # 库：model.py（数据结构+原语） planner.py（A*+重放） _validation.py
-tests/                 # unittest 测试 + dijkstra_reference.py（独立参考，不调用被测核心）
-demo.py                # 固定输入演示（真实计算，无 sleep/预录）
+tests/                 # unittest + 单车/拖车两份独立 Dijkstra 参考
+demo.py                # 旧单车固定输入演示（真实计算，无 sleep/预录）
+demo_iteration.py      # 新拖车固定输入演示（真实计算，无 sleep/预录）
 ```

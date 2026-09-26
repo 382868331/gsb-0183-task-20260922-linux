@@ -13,6 +13,7 @@ from typing import Iterable, Iterator, Optional, Tuple
 from ._validation import require_int, require_int_cell
 
 MAX_GRID_SIDE = 20  # 题面上限：障碍格不超过 20×20
+MAX_ARTICULATION_TURNS = 1  # 牵引车与拖车最多相差一个 90° 档位
 
 
 class Heading(enum.IntEnum):
@@ -84,6 +85,45 @@ class Pose:
 
 
 @dataclass(frozen=True)
+class ArticulatedPose:
+    """铰接车状态：牵引车参考 hitch 在 (x,y)，另含牵引车和拖车的离散朝向。
+
+    拖车车轴格为 hitch 沿拖车朝向反方向一格；因此拖车占用“车轴格 + hitch”。
+    """
+
+    x: int
+    y: int
+    tractor_heading: Heading
+    trailer_heading: Heading
+
+    def __post_init__(self) -> None:
+        require_int("ArticulatedPose.x", self.x)
+        require_int("ArticulatedPose.y", self.y)
+        for name, value in (("tractor_heading", self.tractor_heading), ("trailer_heading", self.trailer_heading)):
+            if isinstance(value, bool) or not isinstance(value, Heading):
+                raise TypeError(f"ArticulatedPose.{name} 必须是 Heading 枚举，收到 {type(value).__name__}: {value!r}")
+
+    @property
+    def hitch_cell(self) -> tuple[int, int]:
+        return (self.x, self.y)
+
+    @property
+    def tractor_pose(self) -> Pose:
+        return Pose(self.x, self.y, self.tractor_heading)
+
+    @property
+    def trailer_axle_cell(self) -> tuple[int, int]:
+        return (self.x - self.trailer_heading.dx, self.y - self.trailer_heading.dy)
+
+    def articulation_turns(self) -> int:
+        diff = (int(self.tractor_heading) - int(self.trailer_heading)) % 4
+        return min(diff, 4 - diff)
+
+    def within_articulation_limit(self) -> bool:
+        return self.articulation_turns() <= MAX_ARTICULATION_TURNS
+
+
+@dataclass(frozen=True)
 class StepEvidence:
     """单步扫掠证据：动作、起终姿态、本步检查过的全部格子、该步代价。"""
 
@@ -92,6 +132,25 @@ class StepEvidence:
     to_pose: Pose
     swept_cells: Tuple[tuple[int, int], ...]
     cost: int
+
+
+@dataclass(frozen=True)
+class ArticulatedStepEvidence:
+    """铰接车单步证据，分别保留牵引车、拖车和连接杆的保守扫掠格。"""
+
+    action: Action
+    from_pose: ArticulatedPose
+    to_pose: ArticulatedPose
+    tractor_swept_cells: Tuple[tuple[int, int], ...]
+    trailer_swept_cells: Tuple[tuple[int, int], ...]
+    hitch_bar_swept_cells: Tuple[tuple[int, int], ...]
+    cost: int
+
+    @property
+    def swept_cells(self) -> Tuple[tuple[int, int], ...]:
+        return tuple(dict.fromkeys(
+            self.tractor_swept_cells + self.trailer_swept_cells + self.hitch_bar_swept_cells
+        ))
 
 
 @dataclass(frozen=True)
@@ -104,6 +163,21 @@ class Plan:
 
     @property
     def final_pose(self) -> Pose:
+        if not self.evidence:
+            raise ValueError("空路径没有 final_pose（起终相同，请直接使用起点姿态）")
+        return self.evidence[-1].to_pose
+
+
+@dataclass(frozen=True)
+class ArticulatedPlan:
+    """铰接车路径：动作序列、总代价和逐步扫掠证据。"""
+
+    actions: Tuple[Action, ...]
+    total_cost: int
+    evidence: Tuple[ArticulatedStepEvidence, ...]
+
+    @property
+    def final_pose(self) -> ArticulatedPose:
         if not self.evidence:
             raise ValueError("空路径没有 final_pose（起终相同，请直接使用起点姿态）")
         return self.evidence[-1].to_pose
@@ -197,6 +271,27 @@ class Grid:
     def is_pose_free(self, pose: Pose) -> bool:
         return all(self.is_free(c) for c in self.pose_cells(pose))
 
+    def articulated_pose_cells(self, pose: ArticulatedPose) -> tuple[tuple[int, int], ...]:
+        """铰接车占用格：牵引车两格与拖车两格（hitch 可能重合）。"""
+        if not isinstance(pose, ArticulatedPose):
+            raise TypeError(f"pose 必须是 ArticulatedPose，收到 {type(pose).__name__}: {pose!r}")
+        return tuple(dict.fromkeys(
+            (pose.hitch_cell,
+             (pose.x + pose.tractor_heading.dx, pose.y + pose.tractor_heading.dy),
+             pose.trailer_axle_cell)
+        ))
+
+    def check_articulated_pose(self, pose: ArticulatedPose, *, name: str = "pose") -> None:
+        if not isinstance(pose, ArticulatedPose):
+            raise TypeError(f"{name} 必须是 ArticulatedPose，收到 {type(pose).__name__}: {pose!r}")
+        if not pose.within_articulation_limit():
+            raise ValueError(f"{name} 的铰接角超过 {MAX_ARTICULATION_TURNS} 个 90° 档位: {pose!r}")
+        for cell in self.articulated_pose_cells(pose):
+            if not self.in_bounds(cell):
+                raise ValueError(f"{name} 的占用格 {cell} 越界（网格 {self._width}x{self._height}）: {pose!r}")
+            if cell in self._obstacles:
+                raise ValueError(f"{name} 的占用格 {cell} 是障碍: {pose!r}")
+
     def __eq__(self, other: object) -> bool:
         return (
             isinstance(other, Grid)
@@ -257,3 +352,100 @@ def successors(grid: Grid, pose: Pose) -> Iterator[tuple[Action, Pose, tuple[tup
         if result is not None:
             nxt, swept = result
             yield action, nxt, swept, action.cost
+
+
+def _unique_cells(cells: Iterable[tuple[int, int]]) -> Tuple[tuple[int, int], ...]:
+    return tuple(dict.fromkeys(cells))
+
+
+def articulated_transition(
+    grid: Grid,
+    pose: ArticulatedPose,
+    action: Action,
+) -> Optional[tuple[ArticulatedPose, ArticulatedStepEvidence]]:
+    """铰接车离散转移。
+
+    平移一格采用一节连接杆的无侧滑格点几何：前进后拖车朝向变为牵引车朝向；
+    倒车只在车列已直时产生离散 cardinal 后继。原地转向只改变牵引车朝向，
+    若超过最大铰接角则转移不可用。
+    """
+    if not isinstance(grid, Grid):
+        raise TypeError(f"grid 必须是 Grid，收到 {type(grid).__name__}: {grid!r}")
+    if not isinstance(pose, ArticulatedPose):
+        raise TypeError(f"pose 必须是 ArticulatedPose，收到 {type(pose).__name__}: {pose!r}")
+    if not isinstance(action, Action):
+        raise TypeError(f"action 必须是 Action，收到 {type(action).__name__}: {action!r}")
+
+    hitch = pose.hitch_cell
+    trailer_axle = pose.trailer_axle_cell
+    h = pose.tractor_heading
+    t = pose.trailer_heading
+
+    if action is Action.FORWARD:
+        nxt = ArticulatedPose(hitch[0] + h.dx, hitch[1] + h.dy, h, h)
+        tractor_cells = _unique_cells(grid.pose_cells(pose.tractor_pose) + grid.pose_cells(nxt.tractor_pose))
+        trailer_cells = _conservative_corner_cells(trailer_axle, hitch, nxt.hitch_cell)
+        bar_cells = trailer_cells
+    elif action is Action.BACKWARD:
+        if h is not t:
+            return None
+        nxt = ArticulatedPose(hitch[0] - h.dx, hitch[1] - h.dy, h, t)
+        next_axle = nxt.trailer_axle_cell
+        tractor_cells = _unique_cells(grid.pose_cells(pose.tractor_pose) + grid.pose_cells(nxt.tractor_pose))
+        trailer_cells = _unique_cells((next_axle, trailer_axle, hitch))
+        bar_cells = trailer_cells
+    else:
+        new_h = h.turn_left() if action is Action.TURN_LEFT else h.turn_right()
+        nxt = ArticulatedPose(pose.x, pose.y, new_h, t)
+        if not nxt.within_articulation_limit():
+            return None
+        d_old = (h.dx, h.dy)
+        d_new = (new_h.dx, new_h.dy)
+        tractor_cells = (
+            hitch,
+            (hitch[0] + d_old[0], hitch[1] + d_old[1]),
+            (hitch[0] + d_new[0], hitch[1] + d_new[1]),
+            (hitch[0] + d_old[0] + d_new[0], hitch[1] + d_old[1] + d_new[1]),
+        )
+        trailer_cells = (trailer_axle, hitch)
+        bar_cells = (trailer_axle, hitch)
+
+    evidence = ArticulatedStepEvidence(
+        action=action,
+        from_pose=pose,
+        to_pose=nxt,
+        tractor_swept_cells=tractor_cells,
+        trailer_swept_cells=trailer_cells,
+        hitch_bar_swept_cells=bar_cells,
+        cost=action.cost,
+    )
+    if all(grid.is_free(cell) for cell in evidence.swept_cells):
+        return nxt, evidence
+    return None
+
+
+def articulated_successors(
+    grid: Grid,
+    pose: ArticulatedPose,
+) -> Iterator[tuple[Action, ArticulatedPose, ArticulatedStepEvidence, int]]:
+    """枚举铰接车全部合法后继。"""
+    for action in Action:
+        result = articulated_transition(grid, pose, action)
+        if result is not None:
+            nxt, evidence = result
+            yield action, nxt, evidence, action.cost
+
+
+def _conservative_corner_cells(
+    old_axle: tuple[int, int],
+    old_hitch: tuple[int, int],
+    new_hitch: tuple[int, int],
+) -> Tuple[tuple[int, int], ...]:
+    cells = (old_axle, old_hitch, new_hitch)
+    min_x = min(cell[0] for cell in cells)
+    max_x = max(cell[0] for cell in cells)
+    min_y = min(cell[1] for cell in cells)
+    max_y = max(cell[1] for cell in cells)
+    if max_x - min_x == 1 and max_y - min_y == 1:
+        return tuple((x, y) for x in range(min_x, max_x + 1) for y in range(min_y, max_y + 1))
+    return _unique_cells(cells)
