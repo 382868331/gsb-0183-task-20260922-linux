@@ -13,6 +13,7 @@ from typing import Iterable, Iterator, Optional, Tuple
 from ._validation import require_int, require_int_cell
 
 MAX_GRID_SIDE = 20  # 题面上限：障碍格不超过 20×20
+MAX_ARTICULATION_DEGREES = 90  # 牵引车与拖车朝向的最大铰接角（格点化四方向下即 0/90，180 禁止）
 
 
 class Heading(enum.IntEnum):
@@ -257,3 +258,231 @@ def successors(grid: Grid, pose: Pose) -> Iterator[tuple[Action, Pose, tuple[tup
         if result is not None:
             nxt, swept = result
             yield action, nxt, swept, action.cost
+
+
+@dataclass(frozen=True)
+class RigState:
+    """带拖车的全状态：牵引车参考格 (x,y)、牵引车朝向、拖车朝向。
+
+    几何约定（题内无侧滑单车轴拖车，格点化）：
+    - 铰接点（挂钩）= 牵引车参考格 (x, y)，连接杆长度恰为 1 格；
+    - 拖车车轴中心 = 铰接点沿拖车朝向反方向 1 格，即
+      (x - trailer_heading.dx, y - trailer_heading.dy)；
+    - 拖车占用车轴格与沿拖车朝向的相邻格（即挂钩格），共两格，
+      因此连接杆始终连接两个轴对齐相邻格，本身也必须不穿障碍；
+    - 铰接角 = 牵引车朝向与拖车朝向的夹角，四方向离散下只允许 0°/90°，
+      180°（折叠）超过 MAX_ARTICULATION_DEGREES，直接不可用。
+    """
+
+    x: int
+    y: int
+    tractor_heading: Heading
+    trailer_heading: Heading
+
+    def __post_init__(self) -> None:
+        require_int("RigState.x", self.x)
+        require_int("RigState.y", self.y)
+        if isinstance(self.tractor_heading, bool) or not isinstance(self.tractor_heading, Heading):
+            raise TypeError(
+                "RigState.tractor_heading 必须是 Heading 枚举，收到 "
+                f"{type(self.tractor_heading).__name__}: {self.tractor_heading!r}"
+            )
+        if isinstance(self.trailer_heading, bool) or not isinstance(self.trailer_heading, Heading):
+            raise TypeError(
+                "RigState.trailer_heading 必须是 Heading 枚举，收到 "
+                f"{type(self.trailer_heading).__name__}: {self.trailer_heading!r}"
+            )
+
+    @property
+    def tractor_pose(self) -> Pose:
+        return Pose(self.x, self.y, self.tractor_heading)
+
+    @property
+    def hitch(self) -> tuple[int, int]:
+        return (self.x, self.y)
+
+    @property
+    def trailer_axle(self) -> tuple[int, int]:
+        return (self.x - self.trailer_heading.dx, self.y - self.trailer_heading.dy)
+
+    def articulation_degrees(self) -> int:
+        """牵引车与拖车朝向的最小夹角（0/90/180）。"""
+        diff = abs(int(self.tractor_heading) - int(self.trailer_heading)) % 4
+        if diff == 3:
+            diff = 1
+        return diff * 90
+
+    def trailer_cells(self) -> tuple[tuple[int, int], tuple[int, int]]:
+        """拖车占用的两格：车轴格 + 挂钩格。"""
+        return (self.trailer_axle, self.hitch)
+
+    def drawbar_cells(self) -> tuple[tuple[int, int], tuple[int, int]]:
+        """连接杆扫过的格段：四方向下连接杆长 1 格，恰为（车轴格, 挂钩格）。"""
+        return self.trailer_cells()
+
+
+def _bbox_cells(cells: Iterable[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
+    xs = [c[0] for c in cells]
+    ys = [c[1] for c in cells]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    return tuple((x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1))
+
+
+def _trailer_sweep(
+    old_axle: tuple[int, int],
+    old_hitch: tuple[int, int],
+    new_axle: tuple[int, int],
+    new_hitch: tuple[int, int],
+) -> tuple[tuple[int, int], ...]:
+    """拖车两段车体（车轴格/挂钩格）起终占用的保守扫掠。
+
+    两格各自平移 1 格时取起终并集；车轴绕挂钩做 90° 折叠/展开时，
+    以四个角点（旧车轴、旧挂钩=新车轴格之一、新车轴、新挂钩）的最小
+    轴对齐包围盒作为保守扫掠，覆盖连续的扇形扫掠所经格。
+    """
+    corners = (old_axle, old_hitch, new_axle, new_hitch)
+    return _bbox_cells(corners)
+
+
+def _drawbar_sweep(
+    old_axle: tuple[int, int],
+    old_hitch: tuple[int, int],
+    new_axle: tuple[int, int],
+    new_hitch: tuple[int, int],
+) -> tuple[tuple[int, int], ...]:
+    """连接杆扫掠：起终两姿态连接杆格段并集的保守包围盒。
+
+    平移拉直时即两格；折叠/展开时连接杆绕挂钩转 90°，用 2×2 包围盒
+    覆盖整根杆，保证不穿障碍。
+    """
+    return _bbox_cells((old_axle, old_hitch, new_axle, new_hitch))
+
+
+def rig_transition(
+    grid: Grid,
+    state: RigState,
+    action: Action,
+) -> Optional[
+    tuple[
+        RigState,
+        tuple[tuple[int, int], ...],
+        tuple[tuple[int, int], ...],
+        tuple[tuple[int, int], ...],
+    ]
+]:
+    """在带拖车状态上执行一个牵引车原语。
+
+    牵引车运动沿用既有原语（前进/后退/原地左右转，代价不变）；拖车角按
+    无侧滑几何做格点化更新（见模块说明）。返回
+    (新状态, 牵引车扫掠格, 拖车扫掠格, 连接杆扫掠格)；
+    铰接超限、拖车/连接杆越界或碰障碍时返回 None。
+
+    平移的无侧滑更新（挂钩位移 d 为 ±1 格）：
+    设 s=+1 前进、s=-1 后退（相对牵引车朝向），θ 为拖车朝向，
+    m 为拖车车轴沿 θ 的有向位移（格），由
+    d = m·u(θ) - (m+s)·u(θ') 反解 θ' 与 m，只接受四方向离散解、|m|≤1，
+    且 |m+s|≤1（新连接杆仍长 1 格），再施加铰接角上限。
+    """
+    if not isinstance(grid, Grid):
+        raise TypeError(f"grid 必须是 Grid，收到 {type(grid).__name__}: {grid!r}")
+    if not isinstance(state, RigState):
+        raise TypeError(f"state 必须是 RigState，收到 {type(state).__name__}: {state!r}")
+    if not isinstance(action, Action):
+        raise TypeError(f"action 必须是 Action，收到 {type(action).__name__}: {action!r}")
+
+    h = state.tractor_heading
+    theta = state.trailer_heading
+    tractor_result = transition(grid, state.tractor_pose, action)
+    if tractor_result is None:
+        return None
+    new_tractor_pose, tractor_swept = tractor_result
+
+    old_hitch = state.hitch
+    old_axle = state.trailer_axle
+    candidates: list[tuple[Heading, tuple[int, int]]] = []
+
+    if action in (Action.FORWARD, Action.BACKWARD):
+        s = 1 if action is Action.FORWARD else -1
+        dx = new_tractor_pose.x - state.x
+        dy = new_tractor_pose.y - state.y
+        # 枚举新拖车朝向（四方向），按无侧滑方程反解车轴位移 m。
+        for new_theta in Heading:
+            ux, uy = new_theta.dx, new_theta.dy
+            kx, ky = ux * theta.dx, uy * theta.dy
+            # d = m·u(θ) - (m+s)·u(θ')；沿新 θ' 投影求 m
+            dot = dx * ux + dy * uy
+            # d·u(θ') = m·u(θ)·u(θ') - (m+s)
+            proj_old = theta.dx * ux + theta.dy * uy  # ±1 或 0
+            denom = proj_old - 1
+            if denom == 0:
+                continue
+            if (dot + s) % (-denom) != 0:
+                continue
+            m = -(dot + s) // denom
+            if abs(m) > 1 or abs(m + s) > 1:
+                continue
+            ax = state.x - theta.dx + m * theta.dx
+            ay = state.y - theta.dy + m * theta.dy
+            new_hitch = new_tractor_pose.x, new_tractor_pose.y
+            new_axle = (new_hitch[0] - new_theta.dx, new_hitch[1] - new_theta.dy)
+            if (ax, ay) != new_axle:
+                continue
+            candidates.append((new_theta, new_axle))
+    else:
+        # 原地转向：挂钩不动，车轴不滑移（最小位移解），拖车朝向不变。
+        new_axle = old_axle
+        candidates.append((theta, new_axle))
+
+    new_hitch = (new_tractor_pose.x, new_tractor_pose.y)
+    valid: list[
+        tuple[
+            RigState,
+            tuple[tuple[int, int], ...],
+            tuple[tuple[int, int], ...],
+            tuple[tuple[int, int], ...],
+        ]
+    ] = []
+    seen: set[RigState] = set()
+    for new_theta, new_axle_cell in candidates:
+        nxt = RigState(new_hitch[0], new_hitch[1], new_tractor_pose.heading, new_theta)
+        if nxt in seen:
+            continue
+        if nxt.articulation_degrees() > MAX_ARTICULATION_DEGREES:
+            continue
+        trailer_swept = _trailer_sweep(old_axle, old_hitch, new_axle_cell, new_hitch)
+        drawbar_swept = _drawbar_sweep(old_axle, old_hitch, new_axle_cell, new_hitch)
+        # 牵引车扫掠沿用单车规则；拖车与连接杆各自保守检查。
+        if all(grid.is_free(c) for c in tractor_swept) \
+                and all(grid.is_free(c) for c in trailer_swept) \
+                and all(grid.is_free(c) for c in drawbar_swept):
+            seen.add(nxt)
+            valid.append((nxt, tractor_swept, trailer_swept, drawbar_swept))
+    # 一个原语在格点化无侧滑模型下至多一个合法离散后继；枚举仅用于方程求解。
+    if not valid:
+        return None
+    return valid[0]
+
+
+def rig_successors(
+    grid: Grid,
+    state: RigState,
+) -> Iterator[
+    tuple[
+        Action,
+        RigState,
+        tuple[tuple[int, int], ...],
+        tuple[tuple[int, int], ...],
+        tuple[tuple[int, int], ...],
+        int,
+    ]
+]:
+    """枚举带拖车状态的全部合法后继。
+
+    产出 (动作, 新状态, 牵引车扫掠, 拖车扫掠, 连接杆扫掠, 代价)。
+    """
+    for action in Action:
+        result = rig_transition(grid, state, action)
+        if result is not None:
+            nxt, tractor_swept, trailer_swept, drawbar_swept = result
+            yield action, nxt, tractor_swept, trailer_swept, drawbar_swept, action.cost
