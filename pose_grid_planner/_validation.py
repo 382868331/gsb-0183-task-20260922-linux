@@ -14,6 +14,28 @@ from collections.abc import Iterable
 from typing import Any
 
 
+def require_finite_number(
+    name: str,
+    value: Any,
+    *,
+    positive: bool = False,
+    nonnegative: bool = False,
+) -> float:
+    """要求物理量为有限实数；bool 不伪装成数字。"""
+    if isinstance(value, bool):
+        raise TypeError(f"{name} 必须是实数，不能是 bool: {value!r}")
+    if not isinstance(value, (int, float)):
+        raise TypeError(f"{name} 必须是 int 或 float，收到 {type(value).__name__}: {value!r}")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{name} 不能是 NaN 或 Infinity: {value!r}")
+    if positive and number <= 0.0:
+        raise ValueError(f"{name} 必须 > 0，收到 {value!r}")
+    if nonnegative and number < 0.0:
+        raise ValueError(f"{name} 必须 >= 0，收到 {value!r}")
+    return number
+
+
 def require_int(name: str, value: Any) -> int:
     """要求 value 为整数；拒绝 bool、NaN/Inf 浮点及其他非整数类型。"""
     if isinstance(value, bool):
