@@ -3,7 +3,7 @@
 公开接口：
     Grid, Heading, Pose, Action, StepEvidence, Plan,
     SearchStatus, SearchResult, plan, replay, ReplayError,
-    transition, successors, heuristic, MAX_GRID_SIDE
+    transition, successors, step_cost, heuristic, MAX_GRID_SIDE
 """
 
 from .model import (
@@ -14,6 +14,7 @@ from .model import (
     Plan,
     Pose,
     StepEvidence,
+    step_cost,
     successors,
     transition,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "Plan",
     "Pose",
     "StepEvidence",
+    "step_cost",
     "successors",
     "transition",
     "ReplayError",

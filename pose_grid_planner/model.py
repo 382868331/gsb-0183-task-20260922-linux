@@ -2,13 +2,16 @@
 
 坐标约定：x 向右增，y 向下增（屏幕坐标）；Heading 顺序 NORTH→EAST→SOUTH→WEST
 对应屏幕上的顺时针。机器人占用“参考格 (x,y)”与“沿 heading 的相邻一格”两格。
+
+地面通行代价：每格可有非负整数“额外通行代价”（默认 0）。一步的代价 =
+动作基础代价 + 本步扫掠过的全部格子的额外代价之和（不只看终点格）。
 """
 
 from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
-from typing import Iterable, Iterator, Optional, Tuple
+from typing import Iterable, Iterator, Mapping, Optional, Tuple
 
 from ._validation import require_int, require_int_cell
 
@@ -110,11 +113,22 @@ class Plan:
 
 
 class Grid:
-    """不可变障碍格。构造即完成全部校验；失败时不产生任何部分构造的对象。"""
+    """不可变障碍格 + 逐格额外通行代价。构造即完成全部校验。
 
-    __slots__ = ("_width", "_height", "_obstacles")
+    terrain 为 {(x, y): extra_cost} 映射，extra_cost 为 >= 0 的整数，
+    表示“进入/扫过该格”的额外代价；未给出的格子额外代价为 0。
+    障碍格不允许携带通行代价（无意义，拒绝而非静默忽略）。
+    """
 
-    def __init__(self, width: int, height: int, obstacles: Iterable[tuple[int, int]] = ()) -> None:
+    __slots__ = ("_width", "_height", "_obstacles", "_terrain")
+
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        obstacles: Iterable[tuple[int, int]] = (),
+        terrain: Optional[Mapping[tuple[int, int], int]] = None,
+    ) -> None:
         width = require_int("width", width)
         height = require_int("height", height)
         if not 1 <= width <= MAX_GRID_SIDE:
@@ -131,13 +145,31 @@ class Grid:
                 raise ValueError(f"obstacles[{i}]={cell} 与之前的障碍格重复（不做静默去重）")
             seen.add(cell)
             cells.append(cell)
+        terrain_map: dict[tuple[int, int], int] = {}
+        if terrain is not None:
+            if isinstance(terrain, (str, bytes)) or not isinstance(terrain, Mapping):
+                raise TypeError(f"terrain 必须是 {{(x, y): 额外代价}} 的映射，收到 {type(terrain).__name__}")
+            obstacle_set = set(cells)
+            for key, raw_cost in terrain.items():
+                cell = require_int_cell(f"terrain 的键 {key!r}", key, width=width, height=height)
+                cost = require_int(f"terrain[{cell}]", raw_cost)
+                if cost < 0:
+                    raise ValueError(f"terrain[{cell}]={cost} 非法，额外通行代价必须 >= 0")
+                if cell in obstacle_set:
+                    raise ValueError(f"terrain[{cell}] 落在障碍格上，障碍格不可通行，不允许携带通行代价")
+                terrain_map[cell] = cost
         self._width = width
         self._height = height
         self._obstacles = frozenset(cells)
+        self._terrain = terrain_map
 
     @classmethod
-    def from_rows(cls, rows: Iterable[str]) -> "Grid":
-        """由字符串行构造：'#' 障碍，'.' 空地。行宽必须一致，字符仅限这两种。"""
+    def from_rows(cls, rows: Iterable[str], terrain_rows: Optional[Iterable[str]] = None) -> "Grid":
+        """由字符串行构造：'#' 障碍，'.' 空地。行宽必须一致，字符仅限这两种。
+
+        terrain_rows 可选，形状必须与 rows 完全一致：'0' 或 '.' 表示额外代价 0，
+        '1'..'9' 表示该格额外通行代价；障碍格对应位置必须是 '0'/'.'。
+        """
         if isinstance(rows, (str, bytes)) or not isinstance(rows, Iterable):
             raise TypeError(f"rows 必须是字符串的可迭代对象，收到 {type(rows).__name__}")
         rows = list(rows)
@@ -159,7 +191,28 @@ class Grid:
                     obstacles.append((x, y))
                 elif ch != ".":
                     raise ValueError(f"rows[{y}][{x}] 字符 {ch!r} 非法，只允许 '#' 和 '.'")
-        return cls(width, height, obstacles)
+        terrain: dict[tuple[int, int], int] = {}
+        if terrain_rows is not None:
+            if isinstance(terrain_rows, (str, bytes)) or not isinstance(terrain_rows, Iterable):
+                raise TypeError(f"terrain_rows 必须是字符串的可迭代对象，收到 {type(terrain_rows).__name__}")
+            terrain_rows = list(terrain_rows)
+            if len(terrain_rows) != height:
+                raise ValueError(f"terrain_rows 行数 {len(terrain_rows)} 与 rows 行数 {height} 不一致")
+            for y, trow in enumerate(terrain_rows):
+                if not isinstance(trow, str):
+                    raise TypeError(f"terrain_rows[{y}] 必须是 str，收到 {type(trow).__name__}: {trow!r}")
+                if len(trow) != width:
+                    raise ValueError(f"terrain_rows[{y}] 宽度 {len(trow)} 与 rows 宽度 {width} 不一致")
+                for x, ch in enumerate(trow):
+                    if ch in ".0":
+                        continue
+                    if ch in "123456789":
+                        if rows[y][x] == "#":
+                            raise ValueError(f"terrain_rows[{y}][{x}] 给障碍格设置了通行代价")
+                        terrain[(x, y)] = int(ch)
+                    else:
+                        raise ValueError(f"terrain_rows[{y}][{x}] 字符 {ch!r} 非法，只允许 '0'..'9' 和 '.'")
+        return cls(width, height, obstacles, terrain)
 
     @property
     def width(self) -> int:
@@ -172,6 +225,15 @@ class Grid:
     @property
     def obstacles(self) -> frozenset[tuple[int, int]]:
         return self._obstacles
+
+    @property
+    def terrain(self) -> Mapping[tuple[int, int], int]:
+        """逐格额外通行代价的只读视图（未列出的格子为 0）。"""
+        return dict(self._terrain)
+
+    def terrain_extra(self, cell: tuple[int, int]) -> int:
+        """单格额外通行代价；未配置的格子为 0。"""
+        return self._terrain.get(cell, 0)
 
     def in_bounds(self, cell: tuple[int, int]) -> bool:
         x, y = cell
@@ -203,13 +265,17 @@ class Grid:
             and self._width == other._width
             and self._height == other._height
             and self._obstacles == other._obstacles
+            and self._terrain == other._terrain
         )
 
     def __hash__(self) -> int:
-        return hash((self._width, self._height, self._obstacles))
+        return hash((self._width, self._height, self._obstacles, frozenset(self._terrain.items())))
 
     def __repr__(self) -> str:
-        return f"Grid(width={self._width}, height={self._height}, obstacles={sorted(self._obstacles)!r})"
+        return (
+            f"Grid(width={self._width}, height={self._height}, "
+            f"obstacles={sorted(self._obstacles)!r}, terrain={self._terrain!r})"
+        )
 
 
 def transition(grid: Grid, pose: Pose, action: Action) -> Optional[tuple[Pose, tuple[tuple[int, int], ...]]]:
@@ -250,10 +316,24 @@ def transition(grid: Grid, pose: Pose, action: Action) -> Optional[tuple[Pose, t
     return None
 
 
+def step_cost(grid: Grid, action: Action, swept_cells: Tuple[tuple[int, int], ...]) -> int:
+    """单步总代价 = 动作基础代价 + 本步扫掠过的全部格子的额外通行代价之和。
+
+    扫掠格集合由 transition() 按车体形状给出（平移为起终占用并集、转向为
+    2x2 包围盒），代价覆盖集合内每一格，不只看终点格。规划与重放共用本函数，
+    保证同一路径的重放代价与规划报告一致。
+    """
+    if not isinstance(grid, Grid):
+        raise TypeError(f"grid 必须是 Grid，收到 {type(grid).__name__}: {grid!r}")
+    if not isinstance(action, Action):
+        raise TypeError(f"action 必须是 Action，收到 {type(action).__name__}: {action!r}")
+    return action.cost + sum(grid.terrain_extra(c) for c in swept_cells)
+
+
 def successors(grid: Grid, pose: Pose) -> Iterator[tuple[Action, Pose, tuple[tuple[int, int], ...], int]]:
-    """枚举姿态的全部合法后继：(动作, 下一姿态, 扫掠格, 代价)。"""
+    """枚举姿态的全部合法后继：(动作, 下一姿态, 扫掠格, 代价)。代价含地面通行代价。"""
     for action in Action:
         result = transition(grid, pose, action)
         if result is not None:
             nxt, swept = result
-            yield action, nxt, swept, action.cost
+            yield action, nxt, swept, step_cost(grid, action, swept)

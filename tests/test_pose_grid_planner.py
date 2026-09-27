@@ -16,6 +16,7 @@ from pose_grid_planner import (
     heuristic,
     plan,
     replay,
+    step_cost,
     successors,
     transition,
 )
@@ -365,6 +366,125 @@ class DijkstraCrossCheckTest(unittest.TestCase):
             self.assertEqual(result.status, SearchStatus.OPTIMAL)
             self.assertEqual(result.plan.total_cost, expected)
             assert_plan_valid(self, grid, start, goal, result.plan)
+
+
+class TerrainCostTest(unittest.TestCase):
+    """地面通行代价：扫掠多格按集合计费、绕行选择、重放一致。"""
+
+    def test_step_cost_sums_all_swept_cells(self) -> None:
+        # 前进扫掠 3 格：起点占用 2 格 + 新头部 1 格，每格额外代价都计入
+        grid = Grid(4, 1, terrain={(1, 0): 2, (2, 0): 3, (3, 0): 5})
+        cost = step_cost(grid, Action.FORWARD, ((1, 0), (2, 0), (3, 0)))
+        self.assertEqual(cost, 10 + 2 + 3 + 5)
+
+    def test_non_destination_cells_are_charged(self) -> None:
+        # 终点格免费、扫掠中间格昂贵：代价仍必须包含中间格
+        grid = Grid(4, 1, terrain={(2, 0): 7})
+        result = transition(grid, Pose(1, 0, E), Action.FORWARD)
+        self.assertIsNotNone(result)
+        _nxt, swept = result
+        self.assertEqual(step_cost(grid, Action.FORWARD, swept), 10 + 7)
+        # 转向扫掠 2x2 共 4 格，非终点格同样计费
+        grid2 = Grid(2, 2, terrain={(1, 1): 4})
+        result2 = transition(grid2, Pose(0, 0, E), Action.TURN_RIGHT)
+        self.assertIsNotNone(result2)
+        _nxt2, swept2 = result2
+        self.assertEqual(tuple(sorted(swept2)), ((0, 0), (0, 1), (1, 0), (1, 1)))
+        self.assertEqual(step_cost(grid2, Action.TURN_RIGHT, swept2), 8 + 4)
+
+    def test_planner_prefers_cheaper_detour(self) -> None:
+        # 直行走廊铺满高代价地面；上方绕行距离更长但更便宜
+        terrain = {(x, 1): 50 for x in range(1, 6)}  # 中间一行极贵
+        grid = Grid(7, 3, terrain=terrain)
+        start, goal = Pose(0, 1, E), Pose(5, 1, E)
+        r = plan(grid, start, goal)
+        self.assertEqual(r.status, SearchStatus.OPTIMAL)
+        # 最优解应绕到 y=0 或 y=2，而不是硬闯 50 代价带
+        self.assertTrue(any(e.to_pose.y != 1 for e in r.plan.evidence))
+        # 与独立参考一致
+        self.assertEqual(
+            r.plan.total_cost,
+            dijkstra_reference(7, 3, frozenset(), to_ref(start), to_ref(goal), terrain),
+        )
+        assert_plan_valid(self, grid, start, goal, r.plan)
+
+    def test_high_cost_terrain_remains_passable(self) -> None:
+        # 只有一条路且必须穿过高代价地面：仍应给出路径，只是更贵
+        grid = Grid(5, 1, terrain={(1, 0): 25})
+        r = plan(grid, Pose(0, 0, E), Pose(3, 0, E))
+        self.assertEqual(r.status, SearchStatus.OPTIMAL)
+        # 前进 3 步，第 1、2 步的扫掠并集都覆盖 (1,0)，各计一次 25
+        self.assertEqual(r.plan.total_cost, 30 + 25 * 2)
+
+    def test_replay_matches_plan_with_terrain(self) -> None:
+        grid = Grid(6, 3, obstacles=[(2, 1)], terrain={(1, 0): 3, (3, 2): 6, (0, 2): 1})
+        start, goal = Pose(0, 0, E), Pose(4, 1, S)
+        r = plan(grid, start, goal)
+        self.assertEqual(r.status, SearchStatus.OPTIMAL)
+        final_pose, evidence = replay(grid, start, r.plan.actions)
+        self.assertEqual(final_pose, goal)
+        self.assertEqual(sum(e.cost for e in evidence), r.plan.total_cost)
+        for pe, re_ in zip(r.plan.evidence, evidence):
+            self.assertEqual(pe.cost, re_.cost)
+
+    def test_terrain_validation(self) -> None:
+        with self.assertRaisesRegex(ValueError, "terrain"):
+            Grid(3, 3, terrain={(1, 1): -1})  # 负代价
+        with self.assertRaisesRegex(ValueError, "障碍"):
+            Grid(3, 3, obstacles=[(1, 1)], terrain={(1, 1): 2})  # 障碍格带代价
+        with self.assertRaises(ValueError):
+            Grid(3, 3, terrain={(9, 9): 1})  # 越界
+        with self.assertRaises(TypeError):
+            Grid(3, 3, terrain={(1, 1): True})  # bool 拒绝
+        with self.assertRaises(TypeError):
+            Grid(3, 3, terrain=[((1, 1), 2)])  # 必须是映射
+        with self.assertRaises(ValueError):
+            Grid(3, 3, terrain={(1, 1): float("nan")})
+
+    def test_from_rows_terrain_rows(self) -> None:
+        grid = Grid.from_rows(["...", "..."], terrain_rows=[".2.", "1.3"])
+        self.assertEqual(grid.terrain_extra((1, 0)), 2)
+        self.assertEqual(grid.terrain_extra((0, 1)), 1)
+        self.assertEqual(grid.terrain_extra((2, 1)), 3)
+        self.assertEqual(grid.terrain_extra((0, 0)), 0)
+        with self.assertRaisesRegex(ValueError, "terrain_rows"):
+            Grid.from_rows([".."], terrain_rows=[".", "."])  # 行数不一致
+        with self.assertRaisesRegex(ValueError, "障碍格"):
+            Grid.from_rows(["#."], terrain_rows=["1."])  # 障碍格带代价
+        with self.assertRaisesRegex(ValueError, "terrain_rows"):
+            Grid.from_rows([".."], terrain_rows=[".x"])  # 非法字符
+
+    def test_random_terrain_matches_reference(self) -> None:
+        rng = random.Random(20260927)
+        for trial in range(30):
+            w = rng.randint(2, 7)
+            h = rng.randint(2, 7)
+            obstacles = {(x, y) for x in range(w) for y in range(h) if rng.random() < 0.2}
+            terrain = {
+                (x, y): rng.randint(0, 9)
+                for x in range(w)
+                for y in range(h)
+                if (x, y) not in obstacles and rng.random() < 0.4
+            }
+            grid = Grid(w, h, obstacles=obstacles, terrain=terrain)
+            free_poses = [
+                Pose(x, y, Heading(hd))
+                for x in range(w)
+                for y in range(h)
+                for hd in range(4)
+                if grid.is_pose_free(Pose(x, y, Heading(hd)))
+            ]
+            if len(free_poses) < 2:
+                continue
+            start, goal = rng.sample(free_poses, 2)
+            expected = dijkstra_reference(w, h, grid.obstacles, to_ref(start), to_ref(goal), terrain)
+            result = plan(grid, start, goal)
+            if expected is None:
+                self.assertEqual(result.status, SearchStatus.NO_PATH, f"trial={trial}")
+            else:
+                self.assertEqual(result.status, SearchStatus.OPTIMAL, f"trial={trial}")
+                self.assertEqual(result.plan.total_cost, expected, f"trial={trial}")
+                assert_plan_valid(self, grid, start, goal, result.plan)
 
 
 if __name__ == "__main__":

@@ -22,11 +22,16 @@ def _cells_of(x, y, h):
     return ((x, y), (x + _DX[h], y + _DY[h]))
 
 
-def dijkstra_reference(width, height, obstacles, start, goal):
+def dijkstra_reference(width, height, obstacles, start, goal, terrain=None):
     """返回 start→goal 的最优代价；无解返回 None。
 
     start/goal 为 (x, y, h)，h ∈ 0..3。obstacles 为 (x, y) 集合。
+    terrain 为 {(x, y): 额外代价}；一步代价 = 动作基础代价 + 扫掠格额外代价之和。
     """
+    terrain = terrain or {}
+
+    def step_cost(base, swept):
+        return base + sum(terrain.get(c, 0) for c in swept)
 
     def free(c):
         return 0 <= c[0] < width and 0 <= c[1] < height and c not in obstacles
@@ -40,7 +45,7 @@ def dijkstra_reference(width, height, obstacles, start, goal):
             nx, ny = x + sign * _DX[h], y + sign * _DY[h]
             swept = set(_cells_of(x, y, h)) | set(_cells_of(nx, ny, h))
             if all(free(c) for c in swept):
-                yield (nx, ny, h), cost
+                yield (nx, ny, h), step_cost(cost, swept)
         # 原地转向：扫掠 = 包含起终占用格的最小轴对齐 2x2（4 格）
         for dh in (1, -1):
             nh = (h + dh) % 4
@@ -51,7 +56,7 @@ def dijkstra_reference(width, height, obstacles, start, goal):
                 (x + _DX[h] + _DX[nh], y + _DY[h] + _DY[nh]),
             }
             if all(free(c) for c in swept):
-                yield (x, y, nh), COST_TURN
+                yield (x, y, nh), step_cost(COST_TURN, swept)
 
     if not pose_ok(*start) or not pose_ok(*goal):
         raise ValueError("start/goal 姿态非法")

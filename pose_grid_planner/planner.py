@@ -3,6 +3,7 @@
 - 状态 = Pose(x, y, heading)。
 - 启发式 h = max(曼哈顿距离 * 10, 最少转向次数 * 8)。两者各自可采纳且一致，
   取 max 仍可采纳且一致，因此 A*（带 closed 集）返回最优解。
+  地面额外通行代价 >= 0 只会增大真实代价，故该启发式在带地面代价时仍可采纳且一致。
 - 搜索预算（max_expansions）耗尽与“证明无解”严格区分：
   堆被取空才算证明无解（NO_PATH）；预算触顶返回 BUDGET_EXHAUSTED。
 """
@@ -15,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
 from ._validation import require_int
-from .model import Action, Grid, Plan, Pose, StepEvidence, successors
+from .model import Action, Grid, Plan, Pose, StepEvidence, step_cost, successors
 
 _FORWARD_COST = Action.FORWARD.cost  # 10，曼哈顿每格的最小平移代价
 _TURN_COST = Action.TURN_LEFT.cost  # 8，单次 90 度转向代价
@@ -43,7 +44,10 @@ class SearchResult:
 
 
 def heuristic(pose: Pose, goal: Pose) -> int:
-    """h = max(曼哈顿*10, 最少转向代价)。只允许这两个分量（题面契约）。"""
+    """h = max(曼哈顿*10, 最少转向代价)。只允许这两个分量（题面契约）。
+
+    不计地面代价：额外通行代价 >= 0，忽略它的下界依然可采纳且一致。
+    """
     manhattan = abs(pose.x - goal.x) + abs(pose.y - goal.y)
     turn_diff = (int(goal.heading) - int(pose.heading)) % 4
     min_turns = min(turn_diff, 4 - turn_diff)
@@ -165,6 +169,7 @@ def replay(grid: Grid, start: Pose, actions: Tuple[Action, ...]) -> Tuple[Pose, 
         if result is None:
             raise ReplayError(f"第 {i} 步 {action.name} 在姿态 {pose!r} 处扫掠不通过（越界或碰障碍）")
         nxt, swept = result
-        evidence.append(StepEvidence(action=action, from_pose=pose, to_pose=nxt, swept_cells=swept, cost=action.cost))
+        cost = step_cost(grid, action, swept)
+        evidence.append(StepEvidence(action=action, from_pose=pose, to_pose=nxt, swept_cells=swept, cost=cost))
         pose = nxt
     return pose, tuple(evidence)

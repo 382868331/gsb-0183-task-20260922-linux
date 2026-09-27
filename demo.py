@@ -21,8 +21,15 @@ ARROW = {Heading.NORTH: "^", Heading.EAST: ">", Heading.SOUTH: "v", Heading.WEST
 
 
 def render(grid: Grid, poses: list[Pose]) -> str:
-    """ASCII 地图：'#' 障碍，方向箭头为路径上各步姿态（后者覆盖前者），'.' 空地。"""
-    canvas = [["#" if (x, y) in grid.obstacles else "." for x in range(grid.width)] for y in range(grid.height)]
+    """ASCII 地图：'#' 障碍，数字为该格额外通行代价，方向箭头为路径姿态，'.' 空地。"""
+    canvas = [
+        [
+            "#" if (x, y) in grid.obstacles
+            else (str(grid.terrain_extra((x, y))) if grid.terrain_extra((x, y)) else ".")
+            for x in range(grid.width)
+        ]
+        for y in range(grid.height)
+    ]
     for p in poses:
         canvas[p.y][p.x] = ARROW[p.heading]
     return "\n".join("".join(row) for row in canvas)
@@ -68,8 +75,47 @@ def demo_normal() -> None:
     print(render(grid, poses))
 
 
+def demo_terrain() -> None:
+    # 地面代价场景：中间直道是高代价泥地（每格额外 9），上下两条土路免费。
+    # 规划应绕行；同一路径重放代价必须与规划报告一致。
+    print("\n=== 场景 2：不同地面通行代价（高代价地面可通过，但更贵） ===")
+    grid = Grid.from_rows(
+        [
+            "..........",
+            "..........",
+            "..........",
+        ],
+        terrain_rows=[
+            "..........",
+            ".99999999.",
+            "..........",
+        ],
+    )
+    start = Pose(0, 1, Heading.EAST)
+    goal = Pose(8, 1, Heading.EAST)
+    print(render(grid, [start, goal]))
+    print(f"start={start}  goal={goal}  （中间一行每格额外代价 9）")
+    result = plan(grid, start, goal)
+    assert result.status is SearchStatus.OPTIMAL, result.status
+    p = result.plan
+    print(f"status={result.status.value}  total_cost={p.total_cost}  steps={len(p.actions)}")
+    print("动作序列:", " ".join(a.name for a in p.actions))
+    detoured = any(e.to_pose.y != 1 for e in p.evidence)
+    print(f"是否绕行高代价地面: {'是' if detoured else '否'}")
+    assert detoured, "规划应选择更便宜的绕行路线"
+
+    # 重放一致性：逐步重放的代价之和必须等于规划报告的总代价
+    final_pose, evidence = replay(grid, start, p.actions)
+    replay_cost = sum(e.cost for e in evidence)
+    assert final_pose == goal
+    assert replay_cost == p.total_cost, (replay_cost, p.total_cost)
+    print(f"重放验证通过：到达 {final_pose}，重放代价 {replay_cost} == 规划代价 {p.total_cost}")
+    poses = [start] + [e.to_pose for e in evidence]
+    print(render(grid, poses))
+
+
 def demo_rejection() -> None:
-    print("\n=== 场景 2：实际触发的拒绝/异常边界 ===")
+    print("\n=== 场景 3：实际触发的拒绝/异常边界 ===")
 
     # 2a. 非法数值输入：NaN 必须被可定位地拒绝（不静默纠正）
     try:
@@ -108,6 +154,7 @@ def demo_rejection() -> None:
 def main() -> None:
     t0 = time.perf_counter()
     demo_normal()
+    demo_terrain()
     demo_rejection()
     print(f"\n总用时 {time.perf_counter() - t0:.2f}s")
 
