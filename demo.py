@@ -21,27 +21,23 @@ ARROW = {Heading.NORTH: "^", Heading.EAST: ">", Heading.SOUTH: "v", Heading.WEST
 
 
 def render(grid: Grid, poses: list[Pose]) -> str:
-    """ASCII 地图：'#' 障碍，方向箭头为路径上各步姿态（后者覆盖前者），'.' 空地。"""
-    canvas = [["#" if (x, y) in grid.obstacles else "." for x in range(grid.width)] for y in range(grid.height)]
+    """ASCII 地图：'#' 障碍，'H' 高价地面，方向箭头为路径姿态，'.' 普通地面。"""
+    canvas = [
+        ["#" if (x, y) in grid.obstacles else ("H" if grid.terrain_cost((x, y)) else ".")
+         for x in range(grid.width)]
+        for y in range(grid.height)
+    ]
     for p in poses:
         canvas[p.y][p.x] = ARROW[p.heading]
     return "\n".join("".join(row) for row in canvas)
 
 
 def demo_normal() -> None:
-    # 确定性固定场景：10x7，1 格宽竖走廊 + 右侧 4 格宽开阔区（转向需要 2x2 扫掠空间）。
-    grid = Grid.from_rows([
-        "..........",
-        ".##.##....",
-        ".##.##....",
-        ".##.##....",
-        ".##.##....",
-        ".##.##....",
-        "..........",
-    ])
-    start = Pose(0, 6, Heading.EAST)
-    goal = Pose(8, 1, Heading.NORTH)
-    print("=== 场景 1：正常规划（含转向与扫掠证据） ===")
+    # 直走第一步会扫过 H；向南绕行多出转向和距离，但总代价更低。
+    grid = Grid(5, 4, terrain_costs={(2, 1): 100})
+    start = Pose(0, 1, Heading.EAST)
+    goal = Pose(3, 1, Heading.NORTH)
+    print("=== 场景 1：地面代价与低价绕行规划（含转向与扫掠证据） ===")
     print(render(grid, [start, goal]))
     print(f"start={start}  goal={goal}")
 

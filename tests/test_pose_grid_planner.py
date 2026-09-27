@@ -24,6 +24,15 @@ from dijkstra_reference import dijkstra_reference
 N, E, S, W = Heading.NORTH, Heading.EAST, Heading.SOUTH, Heading.WEST
 
 
+def terrain_map(rows: list[str], values: dict[str, int]) -> dict[tuple[int, int], int]:
+    return {
+        (x, y): values[ch]
+        for y, row in enumerate(rows)
+        for x, ch in enumerate(row)
+        if ch in values
+    }
+
+
 def to_ref(pose: Pose) -> tuple[int, int, int]:
     return (pose.x, pose.y, int(pose.heading))
 
@@ -241,6 +250,73 @@ class InputValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(ReplayError, r"actions\[0\]"):
             replay(grid, Pose(0, 0, E), ("FORWARD",))
 
+    def test_terrain_cost_validation(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"terrain_costs\[0\]\[1\].*>= 0"):
+            Grid(2, 2, terrain_costs={((0, 0), -1)})
+        with self.assertRaisesRegex(ValueError, r"terrain_costs\[1\].*重复"):
+            Grid(2, 2, terrain_costs=[((0, 0), 1), ((0, 0), 2)])
+        with self.assertRaisesRegex(ValueError, r"terrain_costs\[0\].*障碍"):
+            Grid(2, 2, obstacles=[(0, 0)], terrain_costs={((0, 0), 5)})
+        with self.assertRaisesRegex(ValueError, r"terrain_costs\[0\]\[0].*越界"):
+            Grid(2, 2, terrain_costs={((2, 0), 5)})
+
+
+class TerrainCostTest(unittest.TestCase):
+    """地面代价按一步扫掠过的不同格子计费，规划和重放共用同一规则。"""
+
+    def test_translation_counts_each_distinct_swept_cell_once(self) -> None:
+        grid = Grid(4, 1, terrain_costs={(1, 0): 3, (2, 0): 5, (3, 0): 7})
+        result = transition(grid, Pose(1, 0, E), Action.FORWARD)
+        self.assertIsNotNone(result)
+        nxt, swept = result
+        self.assertEqual(nxt, Pose(2, 0, E))
+        self.assertEqual(tuple(sorted(swept)), ((1, 0), (2, 0), (3, 0)))
+        self.assertEqual(grid.step_cost(Action.FORWARD, swept), 10 + 3 + 5 + 7)
+
+    def test_turn_costs_full_2x2_sweep(self) -> None:
+        grid = Grid(3, 3, terrain_costs={(0, 0): 1, (1, 0): 2, (0, 1): 3, (1, 1): 4})
+        result = transition(grid, Pose(0, 0, E), Action.TURN_RIGHT)
+        self.assertIsNotNone(result)
+        _nxt, swept = result
+        self.assertEqual(grid.step_cost(Action.TURN_RIGHT, swept), 8 + 1 + 2 + 3 + 4)
+
+    def test_planner_chooses_cheaper_detour(self) -> None:
+        rows = [
+            ".....",
+            ".....",
+            ".....",
+        ]
+        # 直线路径在 y=1 连续穿过高价带；向南绕一格只需在入口和出口短接触高价格。
+        expensive = terrain_map(rows, {"H": 100})
+        for x in range(1, 4):
+            expensive[(x, 1)] = 100
+        grid = Grid(5, 3, terrain_costs=expensive)
+        start = Pose(0, 1, E)
+        goal = Pose(3, 1, E)
+        result = plan(grid, start, goal)
+        self.assertEqual(result.status, SearchStatus.OPTIMAL)
+        self.assertEqual(result.plan.total_cost, 586)
+        self.assertLess(result.plan.total_cost, 730)
+        self.assertTrue(any(pose.y == 2 for e in result.plan.evidence for pose in (e.from_pose, e.to_pose)))
+
+    def test_high_cost_terrain_is_still_traversable(self) -> None:
+        # 窄道内没有绕行选择；高价不是障碍，仍应找到路径。
+        grid = Grid(4, 1, terrain_costs={(1, 0): 100, (2, 0): 100, (3, 0): 100})
+        result = plan(grid, Pose(0, 0, E), Pose(2, 0, E))
+        self.assertEqual(result.status, SearchStatus.OPTIMAL)
+        self.assertEqual(result.plan.total_cost, 20 + 500)
+
+    def test_replay_matches_planned_terrain_costs(self) -> None:
+        grid = Grid(4, 4, terrain_costs={(1, 1): 5, (2, 1): 7, (2, 2): 11})
+        start = Pose(1, 1, E)
+        goal = Pose(2, 2, N)
+        result = plan(grid, start, goal)
+        self.assertEqual(result.status, SearchStatus.OPTIMAL)
+        final_pose, replay_evidence = replay(grid, start, result.plan.actions)
+        self.assertEqual(final_pose, goal)
+        self.assertEqual(tuple(e.cost for e in replay_evidence), tuple(e.cost for e in result.plan.evidence))
+        self.assertEqual(sum(e.cost for e in replay_evidence), result.plan.total_cost)
+
 
 class BudgetSemanticsTest(unittest.TestCase):
     """预算耗尽与证明无解必须分开。"""
@@ -365,6 +441,53 @@ class DijkstraCrossCheckTest(unittest.TestCase):
             self.assertEqual(result.status, SearchStatus.OPTIMAL)
             self.assertEqual(result.plan.total_cost, expected)
             assert_plan_valid(self, grid, start, goal, result.plan)
+
+    def test_random_terrain_costs_match_reference(self) -> None:
+        rng = random.Random(67890)
+        cases = 0
+        for trial in range(40):
+            w = rng.randint(2, 8)
+            h = rng.randint(2, 8)
+            obstacles = {
+                (x, y)
+                for x in range(w)
+                for y in range(h)
+                if rng.random() < 0.15
+            }
+            terrain_costs = {
+                (x, y): rng.choice((0, 1, 5, 20, 100))
+                for x in range(w)
+                for y in range(h)
+                if (x, y) not in obstacles
+            }
+            grid = Grid(w, h, obstacles=obstacles, terrain_costs=terrain_costs)
+            free_poses = [
+                Pose(x, y, Heading(hd))
+                for x in range(w)
+                for y in range(h)
+                for hd in range(4)
+                if grid.is_pose_free(Pose(x, y, Heading(hd)))
+            ]
+            if len(free_poses) < 2:
+                continue
+            start, goal = rng.sample(free_poses, 2)
+            expected = dijkstra_reference(
+                w,
+                h,
+                grid.obstacles,
+                to_ref(start),
+                to_ref(goal),
+                terrain_costs=grid.terrain_costs,
+            )
+            result = plan(grid, start, goal)
+            if expected is None:
+                self.assertEqual(result.status, SearchStatus.NO_PATH, f"trial={trial}")
+            else:
+                self.assertEqual(result.status, SearchStatus.OPTIMAL, f"trial={trial}")
+                self.assertEqual(result.plan.total_cost, expected, f"trial={trial}")
+                assert_plan_valid(self, grid, start, goal, result.plan)
+            cases += 1
+        self.assertGreaterEqual(cases, 30)
 
 
 if __name__ == "__main__":

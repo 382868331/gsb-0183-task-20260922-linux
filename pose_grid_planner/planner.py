@@ -165,6 +165,14 @@ def replay(grid: Grid, start: Pose, actions: Tuple[Action, ...]) -> Tuple[Pose, 
         if result is None:
             raise ReplayError(f"第 {i} 步 {action.name} 在姿态 {pose!r} 处扫掠不通过（越界或碰障碍）")
         nxt, swept = result
-        evidence.append(StepEvidence(action=action, from_pose=pose, to_pose=nxt, swept_cells=swept, cost=action.cost))
+        evidence.append(
+            StepEvidence(
+                action=action,
+                from_pose=pose,
+                to_pose=nxt,
+                swept_cells=swept,
+                cost=grid.step_cost(action, swept),
+            )
+        )
         pose = nxt
     return pose, tuple(evidence)

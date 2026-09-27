@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
-from typing import Iterable, Iterator, Optional, Tuple
+from typing import Iterable, Iterator, Mapping, Optional, Tuple
 
 from ._validation import require_int, require_int_cell
 
@@ -110,11 +110,21 @@ class Plan:
 
 
 class Grid:
-    """不可变障碍格。构造即完成全部校验；失败时不产生任何部分构造的对象。"""
+    """不可变障碍格与地面通行代价。
 
-    __slots__ = ("_width", "_height", "_obstacles")
+    terrain_costs 给出自由格的非负整数附加代价；未列出的格子附加代价为 0。
+    构造即完成全部校验；失败时不产生任何部分构造的对象。
+    """
 
-    def __init__(self, width: int, height: int, obstacles: Iterable[tuple[int, int]] = ()) -> None:
+    __slots__ = ("_width", "_height", "_obstacles", "_terrain_costs")
+
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        obstacles: Iterable[tuple[int, int]] = (),
+        terrain_costs: Mapping[tuple[int, int], int] | Iterable[tuple[tuple[int, int], int]] = (),
+    ) -> None:
         width = require_int("width", width)
         height = require_int("height", height)
         if not 1 <= width <= MAX_GRID_SIDE:
@@ -131,9 +141,38 @@ class Grid:
                 raise ValueError(f"obstacles[{i}]={cell} 与之前的障碍格重复（不做静默去重）")
             seen.add(cell)
             cells.append(cell)
+        if isinstance(terrain_costs, (str, bytes)):
+            raise TypeError(
+                f"terrain_costs 必须是 {{cell: cost}} 映射或 (cell, cost) 可迭代对象，收到 {type(terrain_costs).__name__}"
+            )
+        terrain_items = terrain_costs.items() if isinstance(terrain_costs, Mapping) else terrain_costs
+        if not isinstance(terrain_items, Iterable):
+            raise TypeError(
+                f"terrain_costs 必须是 {{cell: cost}} 映射或 (cell, cost) 可迭代对象，收到 {type(terrain_costs).__name__}"
+            )
+        terrain: dict[tuple[int, int], int] = {}
+        for i, raw in enumerate(terrain_items):
+            if isinstance(raw, (str, bytes)) or not isinstance(raw, Iterable):
+                raise TypeError(
+                    f"terrain_costs[{i}] 必须是 (cell, cost) 二元组，收到 {type(raw).__name__}: {raw!r}"
+                )
+            item = list(raw)
+            if len(item) != 2:
+                raise ValueError(f"terrain_costs[{i}] 必须恰好包含 cell 和 cost 两部分，收到 {len(item)} 个: {raw!r}")
+            raw_cell, raw_cost = item
+            cell = require_int_cell(f"terrain_costs[{i}][0]", raw_cell, width=width, height=height)
+            cost = require_int(f"terrain_costs[{i}][1]", raw_cost)
+            if cost < 0:
+                raise ValueError(f"terrain_costs[{i}][1] 必须 >= 0，格子 {cell} 收到 {cost}")
+            if cell in terrain:
+                raise ValueError(f"terrain_costs[{i}] 的格子 {cell} 重复（不做静默覆盖）")
+            if cell in seen:
+                raise ValueError(f"terrain_costs[{i}] 的格子 {cell} 同时是障碍格（障碍不可通行）")
+            terrain[cell] = cost
         self._width = width
         self._height = height
         self._obstacles = frozenset(cells)
+        self._terrain_costs = dict(sorted(terrain.items()))
 
     @classmethod
     def from_rows(cls, rows: Iterable[str]) -> "Grid":
@@ -173,6 +212,26 @@ class Grid:
     def obstacles(self) -> frozenset[tuple[int, int]]:
         return self._obstacles
 
+    @property
+    def terrain_costs(self) -> Mapping[tuple[int, int], int]:
+        """返回已配置地面附加代价的副本；未包含的格子代价为 0。"""
+        return dict(self._terrain_costs)
+
+    def terrain_cost(self, cell: tuple[int, int]) -> int:
+        """返回单格地面附加代价；越界格调用方应先通过扫掠检查。"""
+        return self._terrain_costs.get(cell, 0)
+
+    def step_cost(self, action: Action, swept_cells: Iterable[tuple[int, int]]) -> int:
+        """计算一步代价：动作基础代价 + 扫掠过的不同格子的地面附加代价。
+
+        同一个格子在单步扫掠集合中只计一次；在连续多步中重复占据则每步分别计费。
+        """
+        if not isinstance(action, Action):
+            raise TypeError(f"action 必须是 Action，收到 {type(action).__name__}: {action!r}")
+        if isinstance(swept_cells, (str, bytes)) or not isinstance(swept_cells, Iterable):
+            raise TypeError(f"swept_cells 必须是格子可迭代对象，收到 {type(swept_cells).__name__}")
+        return action.cost + sum(self._terrain_costs.get(cell, 0) for cell in dict.fromkeys(swept_cells))
+
     def in_bounds(self, cell: tuple[int, int]) -> bool:
         x, y = cell
         return 0 <= x < self._width and 0 <= y < self._height
@@ -203,13 +262,17 @@ class Grid:
             and self._width == other._width
             and self._height == other._height
             and self._obstacles == other._obstacles
+            and self._terrain_costs == other._terrain_costs
         )
 
     def __hash__(self) -> int:
-        return hash((self._width, self._height, self._obstacles))
+        return hash((self._width, self._height, self._obstacles, tuple(self._terrain_costs.items())))
 
     def __repr__(self) -> str:
-        return f"Grid(width={self._width}, height={self._height}, obstacles={sorted(self._obstacles)!r})"
+        return (
+            f"Grid(width={self._width}, height={self._height}, "
+            f"obstacles={sorted(self._obstacles)!r}, terrain_costs={self._terrain_costs!r})"
+        )
 
 
 def transition(grid: Grid, pose: Pose, action: Action) -> Optional[tuple[Pose, tuple[tuple[int, int], ...]]]:
@@ -256,4 +319,4 @@ def successors(grid: Grid, pose: Pose) -> Iterator[tuple[Action, Pose, tuple[tup
         result = transition(grid, pose, action)
         if result is not None:
             nxt, swept = result
-            yield action, nxt, swept, action.cost
+            yield action, nxt, swept, grid.step_cost(action, swept)
